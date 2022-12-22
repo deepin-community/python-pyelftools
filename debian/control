@@ -1,0 +1,26 @@
+Source: python-pyelftools
+Maintainer: Tomasz Buchert <tomasz@debian.org>
+Section: python
+Priority: optional
+Build-Depends: debhelper (>= 12),
+               debhelper-compat (= 12),
+               dh-python,
+               python3,
+               python3-setuptools
+Standards-Version: 4.5.0
+Vcs-Browser: https://salsa.debian.org/debian/python-pyelftools
+Vcs-Git: https://salsa.debian.org/debian/python-pyelftools.git
+Homepage: https://github.com/eliben/pyelftools
+Rules-Requires-Root: no
+
+Package: python3-pyelftools
+Architecture: all
+Multi-Arch: foreign
+Depends: ${misc:Depends}, ${python3:Depends}, ${shlibs:Depends}
+Description: pure-python3 library for parsing ELF and DWARF
+ pyelftools is a pure-Python library for parsing and analyzing ELF
+ files and DWARF debugging information. It can be used to query
+ information about compiled binaries and libraries from your Python
+ code.
+ .
+ This package installs the library for Python 3.

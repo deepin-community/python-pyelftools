@@ -1,0 +1,3 @@
+version=3
+opts=filenamemangle=s/.+\/v?(\d\S*)\.tar\.gz/python-pyelftools-$1\.tar\.gz/ \
+  https://github.com/eliben/pyelftools/tags .*/v?(\d\S*)\.tar\.gz

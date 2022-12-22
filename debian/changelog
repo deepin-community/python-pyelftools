@@ -1,0 +1,89 @@
+python-pyelftools (0.27-1) unstable; urgency=medium
+
+  [ Debian Janitor ]
+  * Set upstream metadata fields: Bug-Database, Bug-Submit, Repository,
+    Repository-Browse.
+
+  [ Tomasz Buchert ]
+  * New upstream version 0.27
+
+ -- Tomasz Buchert <tomasz@debian.org>  Sun, 01 Nov 2020 20:39:31 +0100
+
+python-pyelftools (0.26-2) unstable; urgency=medium
+
+  * Drop python2 package (Closes: #938061)
+  * Bump std-ver to 4.5.0
+
+ -- Tomasz Buchert <tomasz@debian.org>  Fri, 01 May 2020 10:22:25 +0200
+
+python-pyelftools (0.26-1) unstable; urgency=medium
+
+  * New upstream version 0.26
+  * Bump std-ver to 4.4.1
+
+ -- Tomasz Buchert <tomasz@debian.org>  Thu, 12 Dec 2019 23:29:34 +0100
+
+python-pyelftools (0.25-2) unstable; urgency=medium
+
+  * refresh packaging (debhelper 12, std-ver 4.3.0)
+
+ -- Tomasz Buchert <tomasz@debian.org>  Sat, 12 Jan 2019 12:50:45 +0100
+
+python-pyelftools (0.25-1) unstable; urgency=medium
+
+  * New upstream version 0.25
+  * Build-depend on setuptools instead of distutils
+
+ -- Tomasz Buchert <tomasz@debian.org>  Tue, 04 Sep 2018 08:28:58 +0200
+
+python-pyelftools (0.24-4.1) unstable; urgency=medium
+
+  * Non-maintainer upload.
+  * Build-depend on python3-distutils. Closes: #896779.
+  * Bump standards version; no changes required.
+
+ -- Matthias Klose <doko@debian.org>  Thu, 03 May 2018 23:57:36 +0200
+
+python-pyelftools (0.24-4) unstable; urgency=medium
+
+  * d/control: update vcs links to salsa
+  * d/control: make packages multi-arch foreign (Closes: #885411)
+  * d/control: fix priority-extra-is-replaced-by-priority-optional
+  * d/copyright: fix insecure-copyright-format-uri
+  * d/control: bump debhelper compat to 11
+
+ -- Tomasz Buchert <tomasz@debian.org>  Sun, 04 Feb 2018 11:07:52 +0100
+
+python-pyelftools (0.24-3) unstable; urgency=medium
+
+  * Revert debhelper and watch changes
+
+ -- Tomasz Buchert <tomasz@debian.org>  Sun, 30 Apr 2017 11:43:50 +0200
+
+python-pyelftools (0.24-2) unstable; urgency=medium
+
+  * d/control: use debhelper 10
+  * d/watch: use watch version 4
+  * d/patches: disable readelf tests (Closes: #860630)
+
+ -- Tomasz Buchert <tomasz@debian.org>  Sun, 23 Apr 2017 19:43:10 +0200
+
+python-pyelftools (0.24-1) unstable; urgency=medium
+
+  * Imported Upstream version 0.24
+  * Bumped Standards-Version to 3.9.8 (no changes needed)
+
+ -- Tomasz Buchert <tomasz@debian.org>  Tue, 09 Aug 2016 00:29:51 +0200
+
+python-pyelftools (0.23-2) unstable; urgency=medium
+
+  * d/copyright: LPGL-2+ -> LGPL-2
+  * d/rules: run test suite manually
+
+ -- Tomasz Buchert <tomasz@debian.org>  Thu, 31 Dec 2015 13:33:27 +0100
+
+python-pyelftools (0.23-1) unstable; urgency=low
+
+  * Initial release (Closes: #778933)
+
+ -- Tomasz Buchert <tomasz@debian.org>  Mon, 27 Apr 2015 13:25:10 +0200
