@@ -24,14 +24,13 @@ setup(
     description='Library for analyzing ELF files and DWARF debugging information',
     long_description=description,
     license='Public domain',
-    version='0.27',
+    version='0.31',
     author='Eli Bendersky',
     maintainer='Eli Bendersky',
     author_email='eliben@gmail.com',
     url='https://github.com/eliben/pyelftools',
     platforms='Cross Platform',
     classifiers = [
-        'Programming Language :: Python :: 2',
         'Programming Language :: Python :: 3',
         ],
 
@@ -45,5 +44,6 @@ setup(
         'elftools.construct', 'elftools.construct.lib',
         ],
 
-    scripts=['scripts/readelf.py']
+    scripts=['scripts/readelf.py'],
+    package_data={'elftools': ['py.typed']}
 )

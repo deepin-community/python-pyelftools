@@ -6,9 +6,11 @@
 # Eli Bendersky (eliben@gmail.com)
 # This code is in the public domain
 #-------------------------------------------------------------------------------
+import os
 from collections import namedtuple
 from bisect import bisect_right
 
+from ..construct.lib.container import Container
 from ..common.exceptions import DWARFError
 from ..common.utils import (struct_parse, dwarf_assert,
                             parse_cstring_from_stream)
@@ -17,10 +19,11 @@ from .compileunit import CompileUnit
 from .abbrevtable import AbbrevTable
 from .lineprogram import LineProgram
 from .callframe import CallFrameInfo
-from .locationlists import LocationLists
-from .ranges import RangeLists
+from .locationlists import LocationLists, LocationListsPair
+from .ranges import RangeLists, RangeListsPair
 from .aranges import ARanges
 from .namelut import NameLUT
+from .dwarf_util import _get_base_offset
 
 
 # Describes a debug section
@@ -57,7 +60,7 @@ DwarfConfig = namedtuple('DwarfConfig',
 
 class DWARFInfo(object):
     """ Acts also as a "context" to other major objects, bridging between
-        various parts of the debug infromation.
+        various parts of the debug information.
     """
     def __init__(self,
             config,
@@ -71,7 +74,15 @@ class DWARFInfo(object):
             debug_ranges_sec,
             debug_line_sec,
             debug_pubtypes_sec,
-            debug_pubnames_sec):
+            debug_pubnames_sec,
+            debug_addr_sec,
+            debug_str_offsets_sec,
+            debug_line_str_sec,
+            debug_loclists_sec,
+            debug_rnglists_sec,
+            debug_sup_sec,
+            gnu_debugaltlink_sec
+            ):
         """ config:
                 A DwarfConfig object
 
@@ -90,8 +101,20 @@ class DWARFInfo(object):
         self.debug_loc_sec = debug_loc_sec
         self.debug_ranges_sec = debug_ranges_sec
         self.debug_line_sec = debug_line_sec
+        self.debug_addr_sec = debug_addr_sec
+        self.debug_str_offsets_sec = debug_str_offsets_sec
+        self.debug_line_str_sec = debug_line_str_sec
         self.debug_pubtypes_sec = debug_pubtypes_sec
         self.debug_pubnames_sec = debug_pubnames_sec
+        self.debug_loclists_sec = debug_loclists_sec
+        self.debug_rnglists_sec = debug_rnglists_sec
+        self.debug_sup_sec = debug_sup_sec
+        self.gnu_debugaltlink_sec = gnu_debugaltlink_sec
+
+        # Sets the supplementary_dwarfinfo to None. Client code can set this
+        # to something else, typically a DWARFInfo file read from an ELFFile
+        # which path is stored in the debug_sup_sec or gnu_debugaltlink_sec.
+        self.supplementary_dwarfinfo = None
 
         # This is the DWARFStructs the context uses, so it doesn't depend on
         # DWARF format and address_size (these are determined per CU) - set them
@@ -103,7 +126,9 @@ class DWARFInfo(object):
 
         # Cache for abbrev tables: a dict keyed by offset
         self._abbrevtable_cache = {}
-
+        # Cache for program lines tables: a dict keyed by offset
+        self._linetable_cache = {}
+ 
         # Cache of compile units and map of their offsets for bisect lookup.
         # Access with .iter_CUs(), .get_CU_containing(), and/or .get_CU_at().
         self._cu_cache = []
@@ -229,10 +254,24 @@ class DWARFInfo(object):
         """
         return parse_cstring_from_stream(self.debug_str_sec.stream, offset)
 
+    def get_string_from_linetable(self, offset):
+        """ Obtain a string from the string table section, given an offset
+            relative to the section.
+        """
+        return parse_cstring_from_stream(self.debug_line_str_sec.stream, offset)
+
     def line_program_for_CU(self, CU):
         """ Given a CU object, fetch the line program it points to from the
             .debug_line section.
             If the CU doesn't point to a line program, return None.
+
+            Note about directory and file names. They are returned as two collections
+            in the lineprogram object's header - include_directory and file_entry.
+
+            In DWARFv5, they have introduced a different, extensible format for those
+            collections. So in a lineprogram v5+, there are two more collections in
+            the header - directories and file_names. Those might contain extra DWARFv5
+            information that is not exposed in include_directory and file_entry.
         """
         # The line program is pointed to by the DW_AT_stmt_list attribute of
         # the top DIE of a CU.
@@ -318,22 +357,43 @@ class DWARFInfo(object):
             return None
 
     def location_lists(self):
-        """ Get a LocationLists object representing the .debug_loc section of
+        """ Get a LocationLists object representing the .debug_loc/debug_loclists section of
             the DWARF data, or None if this section doesn't exist.
+
+            If both sections exist, it returns a LocationListsPair.
         """
-        if self.debug_loc_sec:
-            return LocationLists(self.debug_loc_sec.stream, self.structs)
+        if self.debug_loclists_sec and self.debug_loc_sec is None:
+            return LocationLists(self.debug_loclists_sec.stream, self.structs, 5, self)
+        elif self.debug_loc_sec and self.debug_loclists_sec is None:
+            return LocationLists(self.debug_loc_sec.stream, self.structs, 4, self)
+        elif self.debug_loc_sec and self.debug_loclists_sec:
+            return LocationListsPair(self.debug_loc_sec.stream, self.debug_loclists_sec.stream, self.structs, self)
         else:
             return None
 
     def range_lists(self):
-        """ Get a RangeLists object representing the .debug_ranges section of
+        """ Get a RangeLists object representing the .debug_ranges/.debug_rnglists section of
             the DWARF data, or None if this section doesn't exist.
+
+            If both sections exist, it returns a RangeListsPair.
         """
-        if self.debug_ranges_sec:
-            return RangeLists(self.debug_ranges_sec.stream, self.structs)
+        if self.debug_rnglists_sec and self.debug_ranges_sec is None:
+            return RangeLists(self.debug_rnglists_sec.stream, self.structs, 5, self)
+        elif self.debug_ranges_sec and self.debug_rnglists_sec is None:
+            return RangeLists(self.debug_ranges_sec.stream, self.structs, 4, self)
+        elif self.debug_ranges_sec and self.debug_rnglists_sec:
+            return RangeListsPair(self.debug_ranges_sec.stream, self.debug_rnglists_sec.stream, self.structs, self)
         else:
             return None
+
+    def get_addr(self, cu, addr_index):
+        """Provided a CU and an index, retrieves an address from the debug_addr section
+        """
+        if not self.debug_addr_sec:
+            raise DWARFError('The file does not contain a debug_addr section for indirect address access')
+        # Selectors are not supported, but no assert on that. TODO?
+        cu_addr_base = _get_base_offset(cu, 'DW_AT_addr_base')
+        return struct_parse(cu.structs.Dwarf_target_addr(''), self.debug_addr_sec.stream, cu_addr_base + addr_index*cu.header.address_size)            
 
     #------ PRIVATE ------#
 
@@ -434,25 +494,84 @@ class DWARFInfo(object):
     def _is_supported_version(self, version):
         """ DWARF version supported by this parser
         """
-        return 2 <= version <= 4
+        return 2 <= version <= 5
 
-    def _parse_line_program_at_offset(self, debug_line_offset, structs):
+    def _parse_line_program_at_offset(self, offset, structs):
         """ Given an offset to the .debug_line section, parse the line program
             starting at this offset in the section and return it.
             structs is the DWARFStructs object used to do this parsing.
         """
+
+        if offset in self._linetable_cache:
+            return self._linetable_cache[offset]
+
         lineprog_header = struct_parse(
             structs.Dwarf_lineprog_header,
             self.debug_line_sec.stream,
-            debug_line_offset)
+            offset)
+
+        # DWARF5: resolve names
+        def resolve_strings(self, lineprog_header, format_field, data_field):
+            if lineprog_header.get(format_field, False):
+                data = lineprog_header[data_field]
+                for field in lineprog_header[format_field]:
+                    def replace_value(data, content_type, replacer):
+                        for entry in data:
+                            entry[content_type] = replacer(entry[content_type])
+
+                    if field.form == 'DW_FORM_line_strp':
+                        replace_value(data, field.content_type, self.get_string_from_linetable)
+                    elif field.form == 'DW_FORM_strp':
+                        replace_value(data, field.content_type, self.get_string_from_table)
+                    elif field.form in ('DW_FORM_strp_sup', 'DW_FORM_GNU_strp_alt'):
+                        if self.supplementary_dwarfinfo:
+                            replace_value(data, field.content_type, self.supplementary_dwarfinfo.get_string_fromtable)
+                        else:
+                            replace_value(data, field.content_type, lambda x: str(x))
+                    elif field.form in ('DW_FORM_strp_sup', 'DW_FORM_strx', 'DW_FORM_strx1', 'DW_FORM_strx2', 'DW_FORM_strx3', 'DW_FORM_strx4'):
+                        raise NotImplementedError()
+
+        resolve_strings(self, lineprog_header, 'directory_entry_format', 'directories')
+        resolve_strings(self, lineprog_header, 'file_name_entry_format', 'file_names')
+
+        # DWARF5: provide compatible file/directory name arrays for legacy lineprogram consumers
+        if lineprog_header.get('directories', False):
+            lineprog_header.include_directory = tuple(d.DW_LNCT_path for d in lineprog_header.directories)
+        if lineprog_header.get('file_names', False):
+            lineprog_header.file_entry = tuple(
+                Container(**{
+                    'name':e.get('DW_LNCT_path'),
+                    'dir_index': e.get('DW_LNCT_directory_index'),
+                    'mtime': e.get('DW_LNCT_timestamp'),
+                    'length': e.get('DW_LNCT_size')})
+                for e in lineprog_header.file_names)
 
         # Calculate the offset to the next line program (see DWARF 6.2.4)
-        end_offset = (  debug_line_offset + lineprog_header['unit_length'] +
+        end_offset = (  offset + lineprog_header['unit_length'] +
                         structs.initial_length_field_size())
 
-        return LineProgram(
+        lineprogram = LineProgram(
             header=lineprog_header,
             stream=self.debug_line_sec.stream,
             structs=structs,
             program_start_offset=self.debug_line_sec.stream.tell(),
             program_end_offset=end_offset)
+
+        self._linetable_cache[offset] = lineprogram
+        return lineprogram
+
+    def parse_debugsupinfo(self):
+        """
+        Extract a filename from either .debug_sup or .gnu_debualtlink sections.
+        """
+        if self.debug_sup_sec is not None:
+            self.debug_sup_sec.stream.seek(0)
+            suplink = self.structs.Dwarf_debugsup.parse_stream(self.debug_sup_sec.stream)
+            if suplink.is_supplementary == 0:
+                return suplink.sup_filename
+        if self.gnu_debugaltlink_sec is not None:
+            self.gnu_debugaltlink_sec.stream.seek(0)
+            suplink = self.structs.Dwarf_debugaltlink.parse_stream(self.gnu_debugaltlink_sec.stream)
+            return suplink.sup_filename
+        return None
+

@@ -8,8 +8,8 @@
 #-------------------------------------------------------------------------------
 from contextlib import contextmanager
 from .exceptions import ELFParseError, ELFError, DWARFError
-from .py3compat import int2byte
 from ..construct import ConstructError, ULInt8
+import os
 
 
 def merge_dicts(*dicts):
@@ -19,12 +19,15 @@ def merge_dicts(*dicts):
         result.update(d)
     return result
 
+def bytes2str(b):
+    """Decode a bytes object into a string."""
+    return b.decode('latin-1')
 
 def bytelist2string(bytelist):
     """ Convert a list of byte values (e.g. [0x10 0x20 0x00]) to a bytes object
         (e.g. b'\x10\x20\x00').
     """
-    return b''.join(int2byte(b) for b in bytelist)
+    return b''.join(bytes((b,)) for b in bytelist)
 
 
 def struct_parse(struct, stream, stream_pos=None):
@@ -106,6 +109,32 @@ def read_blob(stream, length):
     """Read length bytes from stream, return a list of ints
     """
     return [struct_parse(ULInt8(''), stream) for i in range(length)]
+
+def save_dwarf_section(section, filename):
+    """Debug helper: dump section contents into a file
+    Section is expected to be one of the debug_xxx_sec elements of DWARFInfo
+    """
+    stream = section.stream
+    pos = stream.tell()
+    stream.seek(0, os.SEEK_SET)
+    section.stream.seek(0)
+    with open(filename, 'wb') as file:
+        data = stream.read(section.size)
+        file.write(data)
+    stream.seek(pos, os.SEEK_SET)
+
+def iterbytes(b):
+    """Return an iterator over the elements of a bytes object.
+
+    For example, for b'abc' yields b'a', b'b' and then b'c'.
+    """
+    for i in range(len(b)):
+        yield b[i:i+1]
+
+def bytes2hex(b, sep=''):
+    if not sep:
+        return b.hex()
+    return sep.join(map('{:02x}'.format, b))
 
 #------------------------- PRIVATE -------------------------
 

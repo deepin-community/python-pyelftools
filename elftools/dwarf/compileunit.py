@@ -97,7 +97,15 @@ class CompileUnit(object):
         self._dielist.insert(0, top)
         self._diemap.insert(0, self.cu_die_offset)
 
+        top._translate_indirect_attributes() # Can't translate indirect attributes until the top DIE has been parsed to the end
+
         return top
+
+    def has_top_DIE(self):
+        """ Returns whether the top DIE in this CU has already been parsed and cached.
+            No parsing on demand!
+        """
+        return len(self._diemap) > 0        
 
     @property
     def size(self):
@@ -155,7 +163,14 @@ class CompileUnit(object):
                 cur_offset += child.size
             elif "DW_AT_sibling" in child.attributes:
                 sibling = child.attributes["DW_AT_sibling"]
-                cur_offset = sibling.value + self.cu_offset
+                if sibling.form in ('DW_FORM_ref1', 'DW_FORM_ref2',
+                                    'DW_FORM_ref4', 'DW_FORM_ref8',
+                                    'DW_FORM_ref', 'DW_FORM_ref_udata'):
+                    cur_offset = sibling.value + self.cu_offset
+                elif sibling.form == 'DW_FORM_ref_addr':
+                    cur_offset = sibling.value
+                else:
+                    raise NotImplementedError('sibling in form %s' % sibling.form)
             else:
                 # If no DW_AT_sibling attribute is provided by the producer
                 # then the whole child subtree must be parsed to find its next
@@ -183,10 +198,14 @@ class CompileUnit(object):
         """ Given a DIE, this yields it with its subtree including null DIEs
             (child list terminators).
         """
+        # If the die is an imported unit, replace it with what it refers to if
+        # we can
+        if die.tag == 'DW_TAG_imported_unit' and self.dwarfinfo.supplementary_dwarfinfo:
+            die = die.get_DIE_from_attribute('DW_AT_import')
         yield die
         if die.has_children:
             for c in die.iter_children():
-                for d in self._iter_DIE_subtree(c):
+                for d in die.cu._iter_DIE_subtree(c):
                     yield d
             yield die._terminator
 

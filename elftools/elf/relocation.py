@@ -13,7 +13,10 @@ from ..common.utils import elf_assert, struct_parse
 from .sections import Section
 from .enums import (
     ENUM_RELOC_TYPE_i386, ENUM_RELOC_TYPE_x64, ENUM_RELOC_TYPE_MIPS,
-    ENUM_RELOC_TYPE_ARM, ENUM_RELOC_TYPE_AARCH64, ENUM_D_TAG)
+    ENUM_RELOC_TYPE_ARM, ENUM_RELOC_TYPE_AARCH64, ENUM_RELOC_TYPE_PPC64,
+    ENUM_RELOC_TYPE_S390X, ENUM_RELOC_TYPE_BPF, ENUM_RELOC_TYPE_LOONGARCH,
+    ENUM_D_TAG)
+from ..construct import Container
 
 
 class Relocation(object):
@@ -106,6 +109,101 @@ class RelocationSection(Section, RelocationTable):
                 header['sh_type'], self.entry_size))
 
 
+class RelrRelocationTable(object):
+    """ RELR compressed relocation table. This stores relative relocations
+        in a compressed format. An entry with an even value serves as an
+        'anchor' that defines a base address. Following this entry are one or
+        more bitmaps for consecutive addresses after the anchor which determine
+        if the corresponding relocation exists (if the bit is 1) or if it is
+        skipped. Addends are stored at the respective addresses (as in REL
+        relocations).
+    """
+
+    def __init__(self, elffile, offset, size, entrysize):
+        self._elffile = elffile
+        self._offset = offset
+        self._size = size
+        self._relr_struct = self._elffile.structs.Elf_Relr
+        self._entrysize = self._relr_struct.sizeof()
+        self._cached_relocations = None
+
+        elf_assert(self._entrysize == entrysize,
+            'Expected RELR entry size to be %s, got %s' % (
+                self._entrysize, entrysize))
+
+    def iter_relocations(self):
+        """ Yield all the relocations in the section
+        """
+
+        # If DT_RELRSZ is zero, offset is meaningless and could be None.
+        if self._size == 0:
+            return []
+
+        limit = self._offset + self._size
+        relr = self._offset
+        # The addresses of relocations in a bitmap are calculated from a base
+        # value provided in an initial 'anchor' relocation.
+        base = None
+        while relr < limit:
+            entry = struct_parse(self._relr_struct,
+                                 self._elffile.stream,
+                                 stream_pos=relr)
+            entry_offset = entry['r_offset']
+            if (entry_offset & 1) == 0:
+                # We found an anchor, take the current value as the base address
+                # for the following bitmaps and move the 'where' pointer to the
+                # beginning of the first bitmap.
+                base = entry_offset
+                base += self._entrysize
+                yield Relocation(entry, self._elffile)
+            else:
+                # We're processing a bitmap.
+                elf_assert(base is not None, 'RELR bitmap without base address')
+                i = 0
+                while True:
+                    # Iterate over all bits except the least significant one.
+                    entry_offset = (entry_offset >> 1)
+                    if entry_offset == 0:
+                        break
+                    # if the current LSB is set, we have a relocation at the
+                    # corresponding address so generate a Relocation with the
+                    # matching offset
+                    if (entry_offset & 1) != 0:
+                        calc_offset = base + i * self._entrysize
+                        yield Relocation(Container(r_offset = calc_offset),
+                                         self._elffile)
+                    i += 1
+                # Advance 'base' past the current bitmap (8 == CHAR_BIT). There
+                # are 63 (or 31 for 32-bit ELFs) entries in each bitmap, and
+                # every bit corresponds to an ELF_addr-sized relocation.
+                base += (8 * self._entrysize - 1) * self._elffile.structs.Elf_addr('').sizeof()
+            # Advance to the next entry
+            relr += self._entrysize
+
+    def num_relocations(self):
+        """ Number of relocations in the section
+        """
+        if self._cached_relocations is None:
+            self._cached_relocations = list(self.iter_relocations())
+        return len(self._cached_relocations)
+
+    def get_relocation(self, n):
+        """ Get the relocation at index #n from the section (Relocation object)
+        """
+        if self._cached_relocations is None:
+            self._cached_relocations = list(self.iter_relocations())
+        return self._cached_relocations[n]
+
+
+class RelrRelocationSection(Section, RelrRelocationTable):
+    """ ELF RELR relocation section. Serves as a collection of RELR relocation entries.
+    """
+    def __init__(self, header, name, elffile):
+        Section.__init__(self, header, name, elffile)
+        RelrRelocationTable.__init__(self, self.elffile,
+            self['sh_offset'], self['sh_size'], self['sh_entsize'])
+
+
 class RelocationHandler(object):
     """ Handles the logic of relocations in ELF files.
     """
@@ -165,9 +263,13 @@ class RelocationHandler(object):
             recipe = self._RELOCATION_RECIPES_X64.get(reloc_type, None)
         elif self.elffile.get_machine_arch() == 'MIPS':
             if reloc.is_RELA():
-                raise ELFRelocationError(
-                    'Unexpected RELA relocation for MIPS: %s' % reloc)
-            recipe = self._RELOCATION_RECIPES_MIPS.get(reloc_type, None)
+                if reloc_type == ENUM_RELOC_TYPE_MIPS['R_MIPS_64']:
+                    if reloc['r_type2'] != 0 or reloc['r_type3'] != 0 or reloc['r_ssym'] != 0:
+                        raise ELFRelocationError(
+                            'Multiple relocations in R_MIPS_64 are not implemented: %s' % reloc)
+                recipe = self._RELOCATION_RECIPES_MIPS_RELA.get(reloc_type, None)
+            else:
+                recipe = self._RELOCATION_RECIPES_MIPS_REL.get(reloc_type, None)
         elif self.elffile.get_machine_arch() == 'ARM':
             if reloc.is_RELA():
                 raise ELFRelocationError(
@@ -175,6 +277,17 @@ class RelocationHandler(object):
             recipe = self._RELOCATION_RECIPES_ARM.get(reloc_type, None)
         elif self.elffile.get_machine_arch() == 'AArch64':
             recipe = self._RELOCATION_RECIPES_AARCH64.get(reloc_type, None)
+        elif self.elffile.get_machine_arch() == '64-bit PowerPC':
+            recipe = self._RELOCATION_RECIPES_PPC64.get(reloc_type, None)
+        elif self.elffile.get_machine_arch() == 'IBM S/390':
+            recipe = self._RELOCATION_RECIPES_S390X.get(reloc_type, None)
+        elif self.elffile.get_machine_arch() == 'Linux BPF - in-kernel virtual machine':
+            recipe = self._RELOCATION_RECIPES_EBPF.get(reloc_type, None)
+        elif self.elffile.get_machine_arch() == 'LoongArch':
+            if not reloc.is_RELA():
+                raise ELFRelocationError(
+                    'Unexpected REL relocation for LoongArch: %s' % reloc)
+            recipe = self._RELOCATION_RECIPES_LOONGARCH.get(reloc_type, None)
 
         if recipe is None:
             raise ELFRelocationError(
@@ -189,6 +302,10 @@ class RelocationHandler(object):
             value_struct = self.elffile.structs.Elf_word('')
         elif recipe.bytesize == 8:
             value_struct = self.elffile.structs.Elf_word64('')
+        elif recipe.bytesize == 1:
+            value_struct = self.elffile.structs.Elf_byte('')
+        elif recipe.bytesize == 2:
+            value_struct = self.elffile.structs.Elf_half('')
         else:
             raise ELFRelocationError('Invalid bytesize %s for relocation' %
                     recipe.bytesize)
@@ -227,7 +344,7 @@ class RelocationHandler(object):
         return value
 
     def _reloc_calc_sym_plus_value(value, sym_value, offset, addend=0):
-        return sym_value + value
+        return sym_value + value + addend
 
     def _reloc_calc_sym_plus_value_pcrel(value, sym_value, offset, addend=0):
         return sym_value + value - offset
@@ -238,8 +355,14 @@ class RelocationHandler(object):
     def _reloc_calc_sym_plus_addend_pcrel(value, sym_value, offset, addend=0):
         return sym_value + addend - offset
 
+    def _reloc_calc_value_minus_sym_addend(value, sym_value, offset, addend=0):
+        return value - sym_value - addend
+
     def _arm_reloc_calc_sym_plus_value_pcrel(value, sym_value, offset, addend=0):
         return sym_value // 4 + value - offset // 4
+
+    def _bpf_64_32_reloc_calc_sym_plus_addend(value, sym_value, offset, addend=0):
+        return (sym_value + addend) // 8 - 1
 
     _RELOCATION_RECIPES_ARM = {
         ENUM_RELOC_TYPE_ARM['R_ARM_ABS32']: _RELOCATION_RECIPE_TYPE(
@@ -261,12 +384,31 @@ class RelocationHandler(object):
     }
 
     # https://dmz-portal.mips.com/wiki/MIPS_relocation_types
-    _RELOCATION_RECIPES_MIPS = {
+    _RELOCATION_RECIPES_MIPS_REL = {
         ENUM_RELOC_TYPE_MIPS['R_MIPS_NONE']: _RELOCATION_RECIPE_TYPE(
             bytesize=4, has_addend=False, calc_func=_reloc_calc_identity),
         ENUM_RELOC_TYPE_MIPS['R_MIPS_32']: _RELOCATION_RECIPE_TYPE(
             bytesize=4, has_addend=False,
             calc_func=_reloc_calc_sym_plus_value),
+    }
+    _RELOCATION_RECIPES_MIPS_RELA = {
+        ENUM_RELOC_TYPE_MIPS['R_MIPS_NONE']: _RELOCATION_RECIPE_TYPE(
+            bytesize=4, has_addend=True, calc_func=_reloc_calc_identity),
+        ENUM_RELOC_TYPE_MIPS['R_MIPS_32']: _RELOCATION_RECIPE_TYPE(
+            bytesize=4, has_addend=True,
+            calc_func=_reloc_calc_sym_plus_value),
+        ENUM_RELOC_TYPE_MIPS['R_MIPS_64']: _RELOCATION_RECIPE_TYPE(
+            bytesize=8, has_addend=True,
+            calc_func=_reloc_calc_sym_plus_value),
+    }
+
+    _RELOCATION_RECIPES_PPC64 = {
+        ENUM_RELOC_TYPE_PPC64['R_PPC64_ADDR32']: _RELOCATION_RECIPE_TYPE(
+            bytesize=4, has_addend=True, calc_func=_reloc_calc_sym_plus_addend),
+        ENUM_RELOC_TYPE_PPC64['R_PPC64_REL32']: _RELOCATION_RECIPE_TYPE(
+            bytesize=4, has_addend=True, calc_func=_reloc_calc_sym_plus_addend_pcrel),
+        ENUM_RELOC_TYPE_PPC64['R_PPC64_ADDR64']: _RELOCATION_RECIPE_TYPE(
+            bytesize=8, has_addend=True, calc_func=_reloc_calc_sym_plus_addend),
     }
 
     _RELOCATION_RECIPES_X86 = {
@@ -292,6 +434,73 @@ class RelocationHandler(object):
             bytesize=4, has_addend=True, calc_func=_reloc_calc_sym_plus_addend),
         ENUM_RELOC_TYPE_x64['R_X86_64_32S']: _RELOCATION_RECIPE_TYPE(
             bytesize=4, has_addend=True, calc_func=_reloc_calc_sym_plus_addend),
+    }
+
+    # https://www.kernel.org/doc/html/latest/bpf/llvm_reloc.html#different-relocation-types
+    _RELOCATION_RECIPES_EBPF = {
+        ENUM_RELOC_TYPE_BPF['R_BPF_NONE']: _RELOCATION_RECIPE_TYPE(
+            bytesize=8, has_addend=False, calc_func=_reloc_calc_identity),
+        ENUM_RELOC_TYPE_BPF['R_BPF_64_64']: _RELOCATION_RECIPE_TYPE(
+            bytesize=8, has_addend=False, calc_func=_reloc_calc_identity),
+        ENUM_RELOC_TYPE_BPF['R_BPF_64_32']: _RELOCATION_RECIPE_TYPE(
+            bytesize=8, has_addend=False, calc_func=_bpf_64_32_reloc_calc_sym_plus_addend),
+        ENUM_RELOC_TYPE_BPF['R_BPF_64_NODYLD32']: _RELOCATION_RECIPE_TYPE(
+            bytesize=4, has_addend=False, calc_func=_reloc_calc_identity),
+        ENUM_RELOC_TYPE_BPF['R_BPF_64_ABS64']: _RELOCATION_RECIPE_TYPE(
+            bytesize=8, has_addend=False, calc_func=_reloc_calc_identity),
+        ENUM_RELOC_TYPE_BPF['R_BPF_64_ABS32']: _RELOCATION_RECIPE_TYPE(
+            bytesize=4, has_addend=False, calc_func=_reloc_calc_identity),
+    }
+
+    # https://github.com/loongson/la-abi-specs/blob/release/laelf.adoc
+    _RELOCATION_RECIPES_LOONGARCH = {
+        ENUM_RELOC_TYPE_LOONGARCH['R_LARCH_NONE']: _RELOCATION_RECIPE_TYPE(
+            bytesize=4, has_addend=False, calc_func=_reloc_calc_identity),
+        ENUM_RELOC_TYPE_LOONGARCH['R_LARCH_32']: _RELOCATION_RECIPE_TYPE(
+            bytesize=4, has_addend=True,
+            calc_func=_reloc_calc_sym_plus_addend),
+        ENUM_RELOC_TYPE_LOONGARCH['R_LARCH_64']: _RELOCATION_RECIPE_TYPE(
+            bytesize=8, has_addend=True,
+            calc_func=_reloc_calc_sym_plus_addend),
+        ENUM_RELOC_TYPE_LOONGARCH['R_LARCH_ADD8']: _RELOCATION_RECIPE_TYPE(
+            bytesize=1, has_addend=True,
+            calc_func=_reloc_calc_sym_plus_value),
+        ENUM_RELOC_TYPE_LOONGARCH['R_LARCH_SUB8']: _RELOCATION_RECIPE_TYPE(
+            bytesize=1, has_addend=True,
+            calc_func=_reloc_calc_value_minus_sym_addend),
+        ENUM_RELOC_TYPE_LOONGARCH['R_LARCH_ADD16']: _RELOCATION_RECIPE_TYPE(
+            bytesize=2, has_addend=True,
+            calc_func=_reloc_calc_sym_plus_value),
+        ENUM_RELOC_TYPE_LOONGARCH['R_LARCH_SUB16']: _RELOCATION_RECIPE_TYPE(
+            bytesize=2, has_addend=True,
+            calc_func=_reloc_calc_value_minus_sym_addend),
+        ENUM_RELOC_TYPE_LOONGARCH['R_LARCH_ADD32']: _RELOCATION_RECIPE_TYPE(
+            bytesize=4, has_addend=True,
+            calc_func=_reloc_calc_sym_plus_value),
+        ENUM_RELOC_TYPE_LOONGARCH['R_LARCH_SUB32']: _RELOCATION_RECIPE_TYPE(
+            bytesize=4, has_addend=True,
+            calc_func=_reloc_calc_value_minus_sym_addend),
+        ENUM_RELOC_TYPE_LOONGARCH['R_LARCH_ADD64']: _RELOCATION_RECIPE_TYPE(
+            bytesize=8, has_addend=True,
+            calc_func=_reloc_calc_sym_plus_value),
+        ENUM_RELOC_TYPE_LOONGARCH['R_LARCH_SUB64']: _RELOCATION_RECIPE_TYPE(
+            bytesize=8, has_addend=True,
+            calc_func=_reloc_calc_value_minus_sym_addend),
+        ENUM_RELOC_TYPE_LOONGARCH['R_LARCH_32_PCREL']: _RELOCATION_RECIPE_TYPE(
+            bytesize=4, has_addend=True,
+            calc_func=_reloc_calc_sym_plus_addend_pcrel),
+        ENUM_RELOC_TYPE_LOONGARCH['R_LARCH_64_PCREL']: _RELOCATION_RECIPE_TYPE(
+            bytesize=8, has_addend=True,
+            calc_func=_reloc_calc_sym_plus_addend_pcrel),
+    }
+
+    _RELOCATION_RECIPES_S390X = {
+        ENUM_RELOC_TYPE_S390X['R_390_32']: _RELOCATION_RECIPE_TYPE(
+            bytesize=4, has_addend=True, calc_func=_reloc_calc_sym_plus_addend),
+        ENUM_RELOC_TYPE_S390X['R_390_PC32']: _RELOCATION_RECIPE_TYPE(
+            bytesize=4, has_addend=True, calc_func=_reloc_calc_sym_plus_addend_pcrel),
+        ENUM_RELOC_TYPE_S390X['R_390_64']: _RELOCATION_RECIPE_TYPE(
+            bytesize=8, has_addend=True, calc_func=_reloc_calc_sym_plus_addend),
     }
 
 

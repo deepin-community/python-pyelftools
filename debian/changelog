@@ -1,3 +1,28 @@
+python-pyelftools (0.31-1) unstable; urgency=medium
+
+  * New upstream version 0.31
+  * Set upstream metadata fields: Contact, Security-Contact.
+
+ -- Tomasz Buchert <tomasz@debian.org>  Sun, 02 Jun 2024 09:45:53 +0200
+
+python-pyelftools (0.30-1) unstable; urgency=medium
+
+  * New upstream version 0.30
+
+ -- Tomasz Buchert <tomasz@debian.org>  Sat, 09 Sep 2023 11:46:13 +0200
+
+python-pyelftools (0.29-1) unstable; urgency=medium
+
+  * New upstream version 0.29
+
+ -- Tomasz Buchert <tomasz@debian.org>  Sat, 20 Aug 2022 23:23:45 +0200
+
+python-pyelftools (0.28-1) unstable; urgency=medium
+
+  * New upstream version 0.28
+
+ -- Tomasz Buchert <tomasz@debian.org>  Sat, 30 Apr 2022 12:22:11 +0200
+
 python-pyelftools (0.27-1) unstable; urgency=medium
 
   [ Debian Janitor ]

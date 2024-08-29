@@ -7,9 +7,10 @@
 # This code is in the public domain
 #-------------------------------------------------------------------------------
 from collections import namedtuple
+from io import BytesIO
 
-from ..common.py3compat import BytesIO, iteritems
 from ..common.utils import struct_parse, bytelist2string, read_blob
+from ..common.exceptions import DWARFError
 
 
 # DWARF expression opcodes. name -> opcode mapping
@@ -84,6 +85,8 @@ DW_OP_name2opcode = dict(
     DW_OP_reinterpret=0xa9,
     DW_OP_lo_user=0xe0,
     DW_OP_GNU_push_tls_address=0xe0,
+    DW_OP_WASM_location=0xed,
+    DW_OP_GNU_uninit=0xf0,
     DW_OP_GNU_implicit_pointer=0xf2,
     DW_OP_GNU_entry_value=0xf3,
     DW_OP_GNU_const_type=0xf4,
@@ -109,12 +112,12 @@ _generate_dynamic_values(DW_OP_name2opcode, 'DW_OP_reg', 0, 31, 0x50)
 _generate_dynamic_values(DW_OP_name2opcode, 'DW_OP_breg', 0, 31, 0x70)
 
 # opcode -> name mapping
-DW_OP_opcode2name = dict((v, k) for k, v in iteritems(DW_OP_name2opcode))
+DW_OP_opcode2name = dict((v, k) for k, v in DW_OP_name2opcode.items())
 
 
 # Each parsed DWARF expression is returned as this type with its numeric opcode,
 # op name (as a string) and a list of arguments.
-DWARFExprOp = namedtuple('DWARFExprOp', 'op op_name args')
+DWARFExprOp = namedtuple('DWARFExprOp', 'op op_name args offset')
 
 
 class DWARFExprParser(object):
@@ -138,6 +141,7 @@ class DWARFExprParser(object):
         while True:
             # Get the next opcode from the stream. If nothing is left in the
             # stream, we're done.
+            offset = stream.tell()
             byte = stream.read(1)
             if len(byte) == 0:
                 break
@@ -150,7 +154,7 @@ class DWARFExprParser(object):
             arg_parser = self._dispatch_table[op]
             args = arg_parser(stream)
 
-            parsed.append(DWARFExprOp(op=op, op_name=op_name, args=args))
+            parsed.append(DWARFExprOp(op=op, op_name=op_name, args=args, offset=offset))
 
         return parsed
 
@@ -195,8 +199,22 @@ def _init_dispatch_table(structs):
     # ULEB128 with datatype DIE offset, then byte, then a blob of that size
     def parse_typedblob():
         return lambda stream: [struct_parse(structs.Dwarf_uleb128(''), stream), read_blob(stream, struct_parse(structs.Dwarf_uint8(''), stream))]
+    
+    # https://yurydelendik.github.io/webassembly-dwarf/
+    # Byte, then variant: 0, 1, 2 => uleb128, 3 => uint32
+    def parse_wasmloc():
+        def parse(stream):
+            op = struct_parse(structs.Dwarf_uint8(''), stream)
+            if 0 <= op <= 2:
+                return [op, struct_parse(structs.Dwarf_uleb128(''), stream)]
+            elif op == 3:
+                return [op, struct_parse(structs.Dwarf_uint32(''), stream)]
+            else:
+                raise DWARFError("Unknown operation code in DW_OP_WASM_location: %d" % (op,))
+        return parse
 
     add('DW_OP_addr', parse_op_addr())
+    add('DW_OP_addrx', parse_arg_struct(structs.Dwarf_uleb128('')))
     add('DW_OP_const1u', parse_arg_struct(structs.Dwarf_uint8('')))
     add('DW_OP_const1s', parse_arg_struct(structs.Dwarf_int8('')))
     add('DW_OP_const2u', parse_arg_struct(structs.Dwarf_uint16('')))
@@ -221,7 +239,7 @@ def _init_dispatch_table(structs):
                     'DW_OP_gt', 'DW_OP_le', 'DW_OP_lt', 'DW_OP_ne', 'DW_OP_nop',
                     'DW_OP_push_object_address', 'DW_OP_form_tls_address',
                     'DW_OP_call_frame_cfa', 'DW_OP_stack_value',
-                    'DW_OP_GNU_push_tls_address']:
+                    'DW_OP_GNU_push_tls_address', 'DW_OP_GNU_uninit']:
         add(opname, parse_noargs())
 
     for n in range(0, 32):
@@ -242,6 +260,15 @@ def _init_dispatch_table(structs):
     add('DW_OP_call4', parse_arg_struct(structs.Dwarf_uint32('')))
     add('DW_OP_call_ref', parse_arg_struct(structs.Dwarf_offset('')))
     add('DW_OP_implicit_value', parse_blob())
+    add('DW_OP_entry_value', parse_nestedexpr())
+    add('DW_OP_const_type', parse_typedblob())
+    add('DW_OP_regval_type', parse_arg_struct2(structs.Dwarf_uleb128(''),
+                                                   structs.Dwarf_uleb128('')))
+    add('DW_OP_deref_type', parse_arg_struct2(structs.Dwarf_uint8(''),
+                                              structs.Dwarf_uleb128('')))
+    add('DW_OP_implicit_pointer', parse_arg_struct2(structs.Dwarf_offset(''),
+                                                        structs.Dwarf_sleb128('')))
+    add('DW_OP_convert', parse_arg_struct(structs.Dwarf_uleb128('')))
     add('DW_OP_GNU_entry_value', parse_nestedexpr())
     add('DW_OP_GNU_const_type', parse_typedblob())
     add('DW_OP_GNU_regval_type', parse_arg_struct2(structs.Dwarf_uleb128(''),
@@ -252,5 +279,6 @@ def _init_dispatch_table(structs):
                                                         structs.Dwarf_sleb128('')))
     add('DW_OP_GNU_parameter_ref', parse_arg_struct(structs.Dwarf_offset('')))
     add('DW_OP_GNU_convert', parse_arg_struct(structs.Dwarf_uleb128('')))
+    add('DW_OP_WASM_location', parse_wasmloc())
 
     return table

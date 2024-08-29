@@ -9,6 +9,7 @@
 #-------------------------------------------------------------------------------
 import argparse
 import os, sys
+import re
 import string
 import traceback
 import itertools
@@ -26,8 +27,7 @@ sys.path.insert(0, '.')
 
 from elftools import __version__
 from elftools.common.exceptions import ELFError
-from elftools.common.py3compat import (
-        ifilter, byte2int, bytes2str, itervalues, str2bytes, iterbytes)
+from elftools.common.utils import bytes2str, iterbytes
 from elftools.elf.elffile import ELFFile
 from elftools.elf.dynamic import DynamicSection, DynamicSegment
 from elftools.elf.enums import ENUM_D_TAG
@@ -48,7 +48,7 @@ from elftools.elf.descriptions import (
     describe_symbol_type, describe_symbol_bind, describe_symbol_visibility,
     describe_symbol_shndx, describe_reloc_type, describe_dyn_tag,
     describe_dt_flags, describe_dt_flags_1, describe_ver_flags, describe_note,
-    describe_attr_tag_arm
+    describe_attr_tag_arm, describe_attr_tag_riscv, describe_symbol_other
     )
 from elftools.elf.constants import E_FLAGS
 from elftools.elf.constants import E_FLAGS_MASKS
@@ -62,10 +62,46 @@ from elftools.dwarf.descriptions import (
     )
 from elftools.dwarf.constants import (
     DW_LNS_copy, DW_LNS_set_file, DW_LNE_define_file)
-from elftools.dwarf.locationlists import LocationParser, LocationEntry
+from elftools.dwarf.locationlists import LocationParser, LocationEntry, LocationViewPair, BaseAddressEntry as LocBaseAddressEntry, LocationListsPair
+from elftools.dwarf.ranges import RangeEntry, BaseAddressEntry as RangeBaseAddressEntry, RangeListsPair
 from elftools.dwarf.callframe import CIE, FDE, ZERO
 from elftools.ehabi.ehabiinfo import CorruptEHABIEntry, CannotUnwindEHABIEntry, GenericEHABIEntry
+from elftools.dwarf.enums import ENUM_DW_UT
 
+def _get_cu_base(cu):
+    top_die = cu.get_top_DIE()
+    attr = top_die.attributes
+    if 'DW_AT_low_pc' in attr:
+        return attr['DW_AT_low_pc'].value
+    elif 'DW_AT_entry_pc' in attr:
+        return attr['DW_AT_entry_pc'].value
+    elif 'DW_AT_ranges' in attr:
+        # Rare case but happens: rangelist in the top DIE.
+        # If there is a base or at least one absolute entry,
+        # this will give us the base IP for the CU.
+        rl = cu.dwarfinfo.range_lists().get_range_list_at_offset(attr['DW_AT_ranges'].value, cu)
+        base_ip = None
+        for r in rl:
+            if isinstance(r, RangeBaseAddressEntry):
+                ip = r.base_address
+            elif isinstance(r, RangeEntry) and r.is_absolute:
+                ip = r.begin_offset
+            else:
+                ip = None
+            if ip is not None and (base_ip is None or ip < base_ip):
+                base_ip = ip
+        if base_ip is None:
+            raise ValueError("Can't find the base IP (low_pc) for a CU")
+        return base_ip
+    else:
+        raise ValueError("Can't find the base IP (low_pc) for a CU")
+
+# Matcher for all control characters, for transforming them into "^X" form when
+# formatting symbol names for display.
+_CONTROL_CHAR_RE = re.compile(r'[\x01-\x1f]')
+
+def _format_symbol_name(s):
+    return _CONTROL_CHAR_RE.sub(lambda match: '^' + chr(0x40 + ord(match[0])), s)
 
 class ReadElf(object):
     """ display_* methods are used to emit output into the output stream
@@ -92,7 +128,7 @@ class ReadElf(object):
         """
         self._emitline('ELF Header:')
         self._emit('  Magic:   ')
-        self._emit(' '.join('%2.2x' % byte2int(b)
+        self._emit(' '.join('%2.2x' % b
                    for b in self.elffile.e_ident_raw))
         self._emitline('      ')
         header = self.elffile.header
@@ -108,7 +144,7 @@ class ReadElf(object):
         self._emitline('  ABI Version:                       %d' %
                 e_ident['EI_ABIVERSION'])
         self._emitline('  Type:                              %s' %
-                describe_e_type(header['e_type']))
+                describe_e_type(header['e_type'], self.elffile))
         self._emitline('  Machine:                           %s' %
                 describe_e_machine(header['e_machine']))
         self._emitline('  Version:                           %s' %
@@ -173,6 +209,10 @@ class ReadElf(object):
             else:
                 description += ', <unrecognized EABI>'
 
+        elif self.elffile['e_machine'] == 'EM_PPC64':
+            if flags & E_FLAGS.EF_PPC64_ABI_V2:
+                description += ', abiv2'
+
         elif self.elffile['e_machine'] == "EM_MIPS":
             if flags & E_FLAGS.EF_MIPS_NOREORDER:
                 description += ", noreorder"
@@ -211,6 +251,34 @@ class ReadElf(object):
             if (flags & E_FLAGS.EF_MIPS_ARCH) == E_FLAGS.EF_MIPS_ARCH_64:
                 description += ", mips64"
 
+        elif self.elffile['e_machine'] == "EM_RISCV":
+            if flags & E_FLAGS.EF_RISCV_RVC:
+                description += ", RVC"
+            if (flags & E_FLAGS.EF_RISCV_RVE):
+                description += ", RVE"
+            if (flags & E_FLAGS.EF_RISCV_TSO):
+                description += ", TSO"
+            if (flags & E_FLAGS.EF_RISCV_FLOAT_ABI) == E_FLAGS.EF_RISCV_FLOAT_ABI_SOFT:
+                description += ", soft-float ABI"
+            if (flags & E_FLAGS.EF_RISCV_FLOAT_ABI) == E_FLAGS.EF_RISCV_FLOAT_ABI_SINGLE:
+                description += ", single-float ABI"
+            if (flags & E_FLAGS.EF_RISCV_FLOAT_ABI) == E_FLAGS.EF_RISCV_FLOAT_ABI_DOUBLE:
+                description += ", double-float ABI"
+            if (flags & E_FLAGS.EF_RISCV_FLOAT_ABI) == E_FLAGS.EF_RISCV_FLOAT_ABI_QUAD:
+                description += ", quad-float ABI"
+
+        elif self.elffile['e_machine'] == "EM_LOONGARCH":
+            if (flags & E_FLAGS.EF_LOONGARCH_ABI_MODIFIER_MASK) == E_FLAGS.EF_LOONGARCH_ABI_SOFT_FLOAT:
+                description += ", SOFT-FLOAT"
+            if (flags & E_FLAGS.EF_LOONGARCH_ABI_MODIFIER_MASK) == E_FLAGS.EF_LOONGARCH_ABI_SINGLE_FLOAT:
+                description += ", SINGLE-FLOAT"
+            if (flags & E_FLAGS.EF_LOONGARCH_ABI_MODIFIER_MASK) == E_FLAGS.EF_LOONGARCH_ABI_DOUBLE_FLOAT:
+                description += ", DOUBLE-FLOAT"
+            if (flags & E_FLAGS.EF_LOONGARCH_OBJABI_MASK) == E_FLAGS.EF_LOONGARCH_OBJABI_V0:
+                description += ", OBJ-v0"
+            if (flags & E_FLAGS.EF_LOONGARCH_OBJABI_MASK) == E_FLAGS.EF_LOONGARCH_OBJABI_V1:
+                description += ", OBJ-v1"
+
         return description
 
     def display_program_headers(self, show_heading=True):
@@ -226,7 +294,7 @@ class ReadElf(object):
         elfheader = self.elffile.header
         if show_heading:
             self._emitline('Elf file type is %s' %
-                describe_e_type(elfheader['e_type']))
+                describe_e_type(elfheader['e_type'], self.elffile))
             self._emitline('Entry point is %s' %
                 self._format_hex(elfheader['e_entry']))
             # readelf weirness - why isn't e_phoff printed as hex? (for section
@@ -387,8 +455,10 @@ class ReadElf(object):
                     section.name))
                 continue
 
-            self._emitline("\nSymbol table '%s' contains %s entries:" % (
-                section.name, section.num_symbols()))
+            self._emitline("\nSymbol table '%s' contains %d %s:" % (
+                section.name,
+                section.num_symbols(),
+                'entry' if section.num_symbols() == 1 else 'entries'))
 
             if self.elffile.elfclass == 32:
                 self._emitline('   Num:    Value  Size Type    Bind   Vis      Ndx Name')
@@ -414,6 +484,13 @@ class ReadElf(object):
                             else:
                                 version_info = '@@%(name)s' % version
 
+                symbol_name = symbol.name
+                # Print section names for STT_SECTION symbols as readelf does
+                if (symbol['st_info']['type'] == 'STT_SECTION'
+                    and symbol['st_shndx'] < self.elffile.num_sections()
+                    and symbol['st_name'] == 0):
+                    symbol_name = self.elffile.get_section(symbol['st_shndx']).name
+
                 # symbol names are truncated to 25 chars, similarly to readelf
                 self._emitline('%6d: %s %s %-7s %-6s %-7s %4s %.25s%s' % (
                     nsym,
@@ -422,11 +499,11 @@ class ReadElf(object):
                     "%5d" % symbol['st_size'] if symbol['st_size'] < 100000 else hex(symbol['st_size']),
                     describe_symbol_type(symbol['st_info']['type']),
                     describe_symbol_bind(symbol['st_info']['bind']),
-                    describe_symbol_visibility(symbol['st_other']['visibility']),
+                    describe_symbol_other(symbol['st_other']),
                     describe_symbol_shndx(self._get_symbol_shndx(symbol,
                                                                  nsym,
                                                                  section_index)),
-                    symbol.name,
+                    _format_symbol_name(symbol_name),
                     version_info))
 
     def display_dynamic_tags(self):
@@ -438,9 +515,10 @@ class ReadElf(object):
                 continue
 
             has_dynamic_sections = True
-            self._emitline("\nDynamic section at offset %s contains %s entries:" % (
+            self._emitline("\nDynamic section at offset %s contains %d %s:" % (
                 self._format_hex(section['sh_offset']),
-                section.num_tags()))
+                section.num_tags(),
+                'entry' if section.num_tags() == 1 else 'entries'))
             self._emitline("  Tag        Type                         Name/Value")
 
             padding = 20 + (8 if self.elffile.elfclass == 32 else 0)
@@ -471,6 +549,8 @@ class ReadElf(object):
                 elif tag.entry.d_tag in ('DT_MIPS_SYMTABNO',
                                          'DT_MIPS_LOCAL_GOTNO'):
                     parsed = str(tag.entry.d_val)
+                elif tag.entry.d_tag == 'DT_AARCH64_BTI_PLT':
+                    parsed = ''
                 else:
                     parsed = '%#x' % tag['d_val']
 
@@ -491,11 +571,11 @@ class ReadElf(object):
                 for note in section.iter_notes():
                       self._emitline("\nDisplaying notes found in: {}".format(
                           section.name))
-                      self._emitline('  Owner                 Data size Description')
+                      self._emitline('  Owner                Data size        Description')
                       self._emitline('  %s %s\t%s' % (
                           note['n_name'].ljust(20),
                           self._format_hex(note['n_descsz'], fieldsize=8),
-                          describe_note(note)))
+                          describe_note(note, self.elffile.header.e_machine)))
 
     def display_relocations(self):
         """ Display the relocations contained in the file
@@ -506,10 +586,11 @@ class ReadElf(object):
                 continue
 
             has_relocation_sections = True
-            self._emitline("\nRelocation section '%.128s' at offset %s contains %s entries:" % (
+            self._emitline("\nRelocation section '%.128s' at offset %s contains %d %s:" % (
                 section.name,
                 self._format_hex(section['sh_offset']),
-                section.num_relocations()))
+                section.num_relocations(),
+                'entry' if section.num_relocations() == 1 else 'entries'))
             if section.is_RELA():
                 self._emitline("  Offset          Info           Type           Sym. Value    Sym. Name + Addend")
             else:
@@ -561,7 +642,7 @@ class ReadElf(object):
                         self._format_hex(
                             symbol['st_value'],
                             fullhex=True, lead0x=False),
-                        symbol_name))
+                        _format_symbol_name(symbol_name)))
                     if section.is_RELA():
                         self._emit(' %s %x' % (
                             '+' if rel['r_addend'] >= 0 else '-',
@@ -588,11 +669,11 @@ class ReadElf(object):
             return
         for ehabi_info in self.elffile.get_ehabi_infos():
             # Unwind section '.ARM.exidx' at offset 0x203e8 contains 1009 entries:
-            self._emitline("\nUnwind section '%s' at offset 0x%x contains %d entries" % (
+            self._emitline("\nUnwind section '%s' at offset 0x%x contains %d %s" % (
                 ehabi_info.section_name(),
                 ehabi_info.section_offset(),
-                ehabi_info.num_entry()
-            ))
+                ehabi_info.num_entry(),
+                'entry' if ehabi_info.num_entry() == 1 else 'entries'))
 
             for i in range(ehabi_info.num_entry()):
                 entry = ehabi_info.get_entry(i)
@@ -628,9 +709,7 @@ class ReadElf(object):
 
         for section in self.elffile.iter_sections():
             if isinstance(section, GNUVerSymSection):
-                self._print_version_section_header(
-                    section, 'Version symbols', lead0x=False)
-
+                self._print_version_section_header(section, 'Version symbols')
                 num_symbols = section.num_symbols()
 
                 # Symbol version info are printed four by four entries
@@ -727,6 +806,8 @@ class ReadElf(object):
         """
         if self.elffile['e_machine'] == 'EM_ARM':
             self._display_arch_specific_arm()
+        elif self.elffile['e_machine'] == 'EM_RISCV':
+            self._display_arch_specific_riscv()
 
     def display_hex_dump(self, section_spec):
         """ Display a hex dump of a section. section_spec is either a section
@@ -758,7 +839,7 @@ class ReadElf(object):
             self._emit('  %s ' % self._format_hex(addr, fieldsize=8))
             for i in range(16):
                 if i < linebytes:
-                    self._emit('%2.2x' % byte2int(data[dataptr + i]))
+                    self._emit('%2.2x' % data[dataptr + i])
                 else:
                     self._emit('  ')
                 if i % 4 == 3:
@@ -766,7 +847,7 @@ class ReadElf(object):
 
             for i in range(linebytes):
                 c = data[dataptr + i : dataptr + i + 1]
-                if byte2int(c[0]) >= 32 and byte2int(c[0]) < 0x7f:
+                if c[0] >= 32 and c[0] < 0x7f:
                     self._emit(bytes2str(c))
                 else:
                     self._emit(bytes2str(b'.'))
@@ -801,14 +882,14 @@ class ReadElf(object):
 
         while dataptr < len(data):
             while ( dataptr < len(data) and
-                    not (32 <= byte2int(data[dataptr]) <= 127)):
+                    not (32 <= data[dataptr] <= 127)):
                 dataptr += 1
 
             if dataptr >= len(data):
                 break
 
             endptr = dataptr
-            while endptr < len(data) and byte2int(data[endptr]) != 0:
+            while endptr < len(data) and data[endptr] != 0:
                 endptr += 1
 
             found = True
@@ -845,6 +926,8 @@ class ReadElf(object):
             self._dump_debug_namelut(dump_what)
         elif dump_what == 'loc':
             self._dump_debug_locations()
+        elif dump_what == 'Ranges':
+            self._dump_debug_ranges()
         else:
             self._emitline('debug dump not yet supported for "%s"' % dump_what)
 
@@ -876,7 +959,8 @@ class ReadElf(object):
                 lead0x = False
             else:
                 lead0x = True
-                fieldsize -= 2
+                if fieldsize is not None:
+                    fieldsize -= 2
 
         s = '0x' if lead0x else ''
         if fullhex:
@@ -899,14 +983,15 @@ class ReadElf(object):
         else:
             num_entries = version_section.num_symbols()
 
-        self._emitline("\n%s section '%s' contains %s entries:" %
-            (name, version_section.name, num_entries))
+        self._emitline("\n%s section '%s' contains %d %s:" % (
+            name, version_section.name, num_entries,
+            'entry' if num_entries == 1 else 'entries'))
         self._emitline('%sAddr: %s  Offset: %s  Link: %i (%s)' % (
             ' ' * indent,
             self._format_hex(
                 version_section['sh_addr'], fieldsize=16, lead0x=lead0x),
             self._format_hex(
-                version_section['sh_offset'], fieldsize=6, lead0x=True),
+                version_section['sh_offset'], fieldsize=8, lead0x=True),
             version_section['sh_link'],
                 self.elffile.get_section(version_section['sh_link']).name
             )
@@ -941,7 +1026,7 @@ class ReadElf(object):
 
     def _symbol_version(self, nsym):
         """ Return a dict containing information on the
-                   or None if no version information is available
+            or None if no version information is available
         """
         self._init_versioninfo()
 
@@ -1043,14 +1128,28 @@ class ReadElf(object):
 
         for cu in self._dwarfinfo.iter_CUs():
             self._emitline('  Compilation Unit @ offset %s:' %
-                self._format_hex(cu.cu_offset))
+                self._format_hex(cu.cu_offset, alternate=True))
             self._emitline('   Length:        %s (%s)' % (
                 self._format_hex(cu['unit_length']),
                 '%s-bit' % cu.dwarf_format()))
-            self._emitline('   Version:       %s' % cu['version']),
-            self._emitline('   Abbrev Offset: %s' % (
-                self._format_hex(cu['debug_abbrev_offset']))),
-            self._emitline('   Pointer Size:  %s' % cu['address_size'])
+            self._emitline('   Version:       %s' % cu['version'])
+            if cu['version'] >= 5:
+                if cu.header.get("unit_type", ''):
+                    unit_type = cu.header.unit_type
+                    self._emitline('   Unit Type:     %s (%d)' % (
+                        unit_type, ENUM_DW_UT.get(cu.header.unit_type, 0)))
+                    self._emitline('   Abbrev Offset: %s' % (
+                        self._format_hex(cu['debug_abbrev_offset'], alternate=True)))
+                    self._emitline('   Pointer Size:  %s' % cu['address_size'])
+                    if unit_type in ('DW_UT_skeleton', 'DW_UT_split_compile'):
+                        self._emitline('   Dwo id:        %s' % cu['dwo_id'])
+                    elif unit_type in ('DW_UT_type', 'DW_UT_split_type'):
+                        self._emitline('   Signature:     0x%x' % cu['type_signature'])
+                        self._emitline('   Type Offset:   0x%x' % cu['type_offset'])
+            else:
+                self._emitline('   Abbrev Offset: %s' % (
+                    self._format_hex(cu['debug_abbrev_offset'], alternate=True))),
+                self._emitline('   Pointer Size:  %s' % cu['address_size'])
 
             # The nesting depth of each DIE within the tree of DIEs must be
             # displayed. To implement this, a counter is incremented each time
@@ -1072,7 +1171,7 @@ class ReadElf(object):
                     die_depth -= 1
                     continue
 
-                for attr in itervalues(die.attributes):
+                for attr in die.attributes.values():
                     name = attr.name
                     # Unknown attribute values are passed-through as integers
                     if isinstance(name, int):
@@ -1102,22 +1201,30 @@ class ReadElf(object):
         """
         if not self._dwarfinfo.has_debug_info:
             return
-        self._emitline('Decoded dump of debug contents of section %s:\n' % self._dwarfinfo.debug_line_sec.name)
+        self._emitline('Contents of the %s section:' % self._dwarfinfo.debug_line_sec.name)
+        self._emitline()
+        lineprogram_list = []
 
         for cu in self._dwarfinfo.iter_CUs():
+            # Avoid dumping same lineprogram multiple times
             lineprogram = self._dwarfinfo.line_program_for_CU(cu)
+
+            if lineprogram in lineprogram_list:
+                continue 
+
+            lineprogram_list.append(lineprogram)
+            ver5 = lineprogram.header.version >= 5
 
             cu_filename = bytes2str(lineprogram['file_entry'][0].name)
             if len(lineprogram['include_directory']) > 0:
-                dir_index = lineprogram['file_entry'][0].dir_index
-                if dir_index > 0:
-                    dir = lineprogram['include_directory'][dir_index - 1]
-                else:
-                    dir = b'.'
-                cu_filename = '%s/%s' % (bytes2str(dir), cu_filename)
+                # GNU readelf 2.38 only outputs directory in wide mode
+                self._emitline('%s:' % cu_filename)
+            else:
+                self._emitline('CU: %s:' % cu_filename)
 
-            self._emitline('CU: %s:' % cu_filename)
-            self._emitline('File name                            Line number    Starting address')
+            self._emitline('File name                            Line number    Starting address    Stmt')
+            # GNU readelf has a View column that we don't try to replicate
+            # The autotest has logic in place to ignore that
 
             # Print each state's file, line and address information. For some
             # instructions other output is needed to be compatible with
@@ -1139,23 +1246,21 @@ class ReadElf(object):
                     elif entry.command == DW_LNE_define_file:
                         self._emitline('%s:' % (
                             bytes2str(lineprogram['include_directory'][entry.args[0].dir_index])))
-                elif not state.end_sequence:
-                    # readelf doesn't print the state after end_sequence
-                    # instructions. I think it's a bug but to be compatible
-                    # I don't print them too.
-                    if lineprogram['version'] < 4:
-                        self._emitline('%-35s  %11d  %18s' % (
-                            bytes2str(lineprogram['file_entry'][state.file - 1].name),
-                            state.line,
-                            '0' if state.address == 0 else
-                                self._format_hex(state.address)))
-                    else:
-                        self._emitline('%-35s  %11d  %18s[%d]' % (
-                            bytes2str(lineprogram['file_entry'][state.file - 1].name),
-                            state.line,
-                            '0' if state.address == 0 else
-                                self._format_hex(state.address),
-                            state.op_index))
+                elif lineprogram['version'] < 4 or self.elffile['e_machine'] == 'EM_PPC64':
+                    self._emitline('%-35s  %11s  %18s    %s' % (
+                        bytes2str(lineprogram['file_entry'][state.file - 1].name),
+                        state.line if not state.end_sequence else '-',
+                        '0' if state.address == 0 else self._format_hex(state.address),
+                        'x' if state.is_stmt and not state.end_sequence else ''))
+                else:
+                    # In readelf, on non-VLIW machines there is no op_index postfix after address.
+                    # It used to be unconditional.
+                    self._emitline('%-35s  %s  %18s%s %s' % (
+                        bytes2str(lineprogram['file_entry'][state.file - 1].name),
+                        "%11d" % (state.line,) if not state.end_sequence else '-',
+                        '0' if state.address == 0 else self._format_hex(state.address),
+                        '' if lineprogram.header.maximum_operations_per_instruction == 1 else '[%d]' % (state.op_index,),
+                        'x' if state.is_stmt and not state.end_sequence else ''))
                 if entry.command == DW_LNS_copy:
                     # Another readelf oddity...
                     self._emitline()
@@ -1163,9 +1268,9 @@ class ReadElf(object):
     def _dump_frames_info(self, section, cfi_entries):
         """ Dump the raw call frame info in a section.
 
-        `section` is the Section instance that contains the call frame info
-        while `cfi_entries` must be an iterable that yields the sequence of
-        CIE or FDE instances.
+            `section` is the Section instance that contains the call frame info
+            while `cfi_entries` must be an iterable that yields the sequence of
+            CIE or FDE instances.
         """
         self._emitline('Contents of the %s section:' % section.name)
 
@@ -1265,8 +1370,11 @@ class ReadElf(object):
         aranges_table = self._dwarfinfo.get_aranges()
         if aranges_table == None:
             return
-        # seems redundent, but we need to get the unsorted set of entries to match system readelf
-        unordered_entries = aranges_table._get_entries()
+        # Seems redundant, but we need to get the unsorted set of entries
+        # to match system readelf.
+        # Also, sometimes there are blank sections in aranges, but readelf
+        # dumps them, so we should too.
+        unordered_entries = aranges_table._get_entries(need_empty=True)
 
         if len(unordered_entries) == 0:
             self._emitline()
@@ -1289,9 +1397,10 @@ class ReadElf(object):
                 self._emitline('  Segment Size:             %d' % (entry.segment_size))
                 self._emitline()
                 self._emitline('    Address            Length')
-            self._emitline('    %s %s' % (
-                self._format_hex(entry.begin_addr, fullhex=True, lead0x=False),
-                self._format_hex(entry.length, fullhex=True, lead0x=False)))
+            if entry.begin_addr != 0 or entry.length != 0:
+                self._emitline('    %s %s' % (
+                    self._format_hex(entry.begin_addr, fullhex=True, lead0x=False),
+                    self._format_hex(entry.length, fullhex=True, lead0x=False)))
             prev_offset = entry.info_offset
         self._emitline('    %s %s' % (
                 self._format_hex(0, fullhex=True, lead0x=False),
@@ -1352,24 +1461,20 @@ class ReadElf(object):
 
             # Look at the registers the decoded table describes.
             # We build reg_order here to match readelf's order. In particular,
-            # registers are sorted by their number, and the register matching
-            # ra_regnum is always listed last with a special heading.
+            # registers are sorted by their number, so that the register
+            # matching ra_regnum is usually listed last with a special heading.
+            # (LoongArch is a notable exception in that its return register's
+            # DWARF register number is not greater than other GPRs.)
             decoded_table = entry.get_decoded()
-            reg_order = sorted(ifilter(
-                lambda r: r != ra_regnum,
-                decoded_table.reg_order))
+            reg_order = sorted(decoded_table.reg_order)
             if len(decoded_table.reg_order):
-
                 # Headings for the registers
                 for regnum in reg_order:
+                    if regnum == ra_regnum:
+                        self._emit('ra      ')
+                        continue
                     self._emit('%-6s' % describe_reg_name(regnum))
-                self._emitline('ra      ')
-
-                # Now include ra_regnum in reg_order to print its values
-                # similarly to the other registers.
-                reg_order.append(ra_regnum)
-            else:
-                self._emitline()
+            self._emitline()
 
             for line in decoded_table.table:
                 self._emit(self._format_hex(
@@ -1392,7 +1497,7 @@ class ReadElf(object):
 
     def _dump_debug_frames_interp(self):
         """ Dump the interpreted (decoded) frame information from .debug_frame
-        and .eh_framae sections.
+            and .eh_frame sections.
         """
         if self._dwarfinfo.has_EH_CFI():
             self._dump_frames_interp_info(
@@ -1406,85 +1511,245 @@ class ReadElf(object):
                     self._dwarfinfo.CFI_entries())
 
     def _dump_debug_locations(self):
-        """ Dump the location lists from .debug_location section
+        """ Dump the location lists from .debug_loc/.debug_loclists section
         """
-        def _get_cu_base(cu):
-            top_die = cu.get_top_DIE()
-            attr = top_die.attributes
-            if 'DW_AT_low_pc' in attr:
-                return attr['DW_AT_low_pc'].value
-            elif 'DW_AT_entry_pc' in attr:
-                return attr['DW_AT_entry_pc'].value
-            else:
-                raise ValueError("Can't find the base IP (low_pc) for a CU")
-
         di = self._dwarfinfo
-        loc_lists = di.location_lists()
-        if not loc_lists: # No locations section - readelf outputs nothing
+        loc_lists_sec = di.location_lists()
+        if not loc_lists_sec: # No locations section - readelf outputs nothing
             return
 
-        loc_lists = list(loc_lists.iter_location_lists())
-        if len(loc_lists) == 0:
-            # Present but empty locations section - readelf outputs a message
-            self._emitline("\nSection '%s' has no debugging data." % di.debug_loc_sec.name)
-            return
+        if isinstance(loc_lists_sec, LocationListsPair):
+            self._dump_debug_locsection(di, loc_lists_sec._loc)
+            self._dump_debug_locsection(di, loc_lists_sec._loclists)
+        else:
+            self._dump_debug_locsection(di, loc_lists_sec)
+        
+    def _dump_debug_locsection(self, di, loc_lists_sec):        
+        """ Dump the location lists from .debug_loc/.debug_loclists section
+        """
+        ver5 = loc_lists_sec.version >= 5
+        section_name = (di.debug_loclists_sec if ver5 else di.debug_loc_sec).name
 
         # To dump a location list, one needs to know the CU.
-        # Scroll through DIEs once, list the known location list offsets
+        # Scroll through DIEs once, list the known location list offsets.
+        # Don't need this CU/DIE scan if all entries are absolute or prefixed by base,
+        # but let's not optimize for that yet.
         cu_map = dict() # Loc list offset => CU
         for cu in di.iter_CUs():
             for die in cu.iter_DIEs():
                 for key in die.attributes:
                     attr = die.attributes[key]
                     if (LocationParser.attribute_has_location(attr, cu['version']) and
-                        not LocationParser._attribute_has_loc_expr(attr, cu['version'])):
+                        LocationParser._attribute_has_loc_list(attr, cu['version'])):
                         cu_map[attr.value] = cu
 
         addr_size = di.config.default_address_size # In bytes, 4 or 8
         addr_width = addr_size * 2 # In hex digits, 8 or 16
         line_template = "    %%08x %%0%dx %%0%dx %%s%%s" % (addr_width, addr_width)
 
-        self._emitline('Contents of the %s section:\n' % di.debug_loc_sec.name)
+        loc_lists = list(loc_lists_sec.iter_location_lists())
+        if len(loc_lists) == 0:
+            # Present but empty locations section - readelf outputs a message
+            self._emitline("\nSection '%s' has no debugging data." % (section_name,))
+            return
+
+        self._emitline('Contents of the %s section:\n' % (section_name,))
         self._emitline('    Offset   Begin            End              Expression')
         for loc_list in loc_lists:
-            cu = cu_map.get(loc_list[0].entry_offset, False)
-            if not cu:
-                raise ValueError("Location list can't be tracked to a CU")
-            base_ip = _get_cu_base(cu)
-            for entry in loc_list:
-                # TODO: support BaseAddressEntry lines
-                expr = describe_DWARF_expr(entry.loc_expr, cu.structs, cu.cu_offset)
+            self._dump_loclist(loc_list, line_template, cu_map)
+
+    def _dump_loclist(self, loc_list, line_template, cu_map):
+        in_views = False
+        has_views = False
+        base_ip = None
+        loc_entry_count = 0
+        cu = None
+        for entry in loc_list:
+            if isinstance(entry, LocationViewPair):
+                has_views = in_views = True
+                # The "v" before address is conditional in binutils, haven't figured out how
+                self._emitline("    %08x v%015x v%015x location view pair" % (entry.entry_offset, entry.begin, entry.end))
+            else:
+                if in_views:
+                    in_views = False
+                    self._emitline("")
+
+                # Readelf quirk: indexed loclists don't show the real base IP
+                if cu_map is None:
+                    base_ip = 0
+                elif cu is None:
+                    cu = cu_map.get(entry.entry_offset, False)
+                    if not cu:
+                        raise ValueError("Location list can't be tracked to a CU")
+
+                if isinstance(entry, LocationEntry):
+                    if base_ip is None and not entry.is_absolute:
+                        base_ip = _get_cu_base(cu)
+
+                    begin_offset = (0 if entry.is_absolute else base_ip) + entry.begin_offset
+                    end_offset = (0 if entry.is_absolute else base_ip) + entry.end_offset
+                    expr = describe_DWARF_expr(entry.loc_expr, cu.structs, cu.cu_offset)
+                    if has_views:
+                        view = loc_list[loc_entry_count]
+                        postfix = ' (start == end)' if entry.begin_offset == entry.end_offset and view.begin == view.end else ''
+                        self._emitline('    %08x v%015x v%015x views at %08x for:' %(
+                            entry.entry_offset,
+                            view.begin,
+                            view.end,
+                            view.entry_offset))
+                        self._emitline('             %016x %016x %s%s' %(
+                            begin_offset,
+                            end_offset,
+                            expr,
+                            postfix))
+                        loc_entry_count += 1
+                    else:
+                        postfix = ' (start == end)' if entry.begin_offset == entry.end_offset else ''
+                        self._emitline(line_template % (
+                            entry.entry_offset,
+                            begin_offset,
+                            end_offset,
+                            expr,
+                            postfix))
+                elif isinstance(entry, LocBaseAddressEntry):
+                    base_ip = entry.base_address
+                    self._emitline("    %08x %016x (base address)" % (entry.entry_offset, entry.base_address))
+
+        # Pyelftools doesn't store the terminating entry,
+        # but readelf emits its offset, so this should too.
+        last = loc_list[-1]
+        self._emitline("    %08x <End of list>" % (last.entry_offset + last.entry_length))
+
+    def _dump_debug_ranges(self):
+        # TODO: GNU readelf format doesn't need entry_length?
+        di = self._dwarfinfo
+        range_lists_sec = di.range_lists()
+        if not range_lists_sec: # No ranges section - readelf outputs nothing
+            return
+
+        if isinstance(range_lists_sec, RangeListsPair):
+            self._dump_debug_rangesection(di, range_lists_sec._ranges)
+            self._dump_debug_rangesection(di, range_lists_sec._rnglists)
+        else:
+            self._dump_debug_rangesection(di, range_lists_sec)
+
+    def _dump_debug_rnglists_CU_header(self, cu):
+        self._emitline(' Table at Offset: %s:' % self._format_hex(cu.cu_offset, alternate=True))
+        self._emitline('  Length:          %s' % self._format_hex(cu.unit_length, alternate=True))
+        self._emitline('  DWARF version:   %d' % cu.version)
+        self._emitline('  Address size:    %d' % cu.address_size)
+        self._emitline('  Segment size:    %d' % cu.segment_selector_size)
+        self._emitline('  Offset entries:  %d\n' % cu.offset_count)
+        if cu.offsets and len(cu.offsets):
+            self._emitline('  Offsets starting at 0x%x:' % cu.offset_table_offset)
+            for i_offset in enumerate(cu.offsets):
+                self._emitline('    [%6d] 0x%x' % i_offset)
+
+    def _dump_debug_rangesection(self, di, range_lists_sec):
+        # Last amended to match readelf 2.41
+        ver5 = range_lists_sec.version >= 5
+        section_name = (di.debug_rnglists_sec if ver5 else di.debug_ranges_sec).name
+        addr_size = di.config.default_address_size # In bytes, 4 or 8
+        addr_width = addr_size * 2 # In hex digits, 8 or 16
+        line_template = "    %%08x %%0%dx %%0%dx %%s" % (addr_width, addr_width)
+        base_template = "    %%08x %%0%dx (base address)" % (addr_width)
+        base_template_indexed = "    %%08x %%0%dx (base address index) %%0%dx (base address)" % (addr_width, addr_width)
+
+        # In order to determine the base address of the range
+        # We need to know the corresponding CU.
+        cu_map = {die.attributes['DW_AT_ranges'].value : cu  # Range list offset => CU
+            for cu in di.iter_CUs()
+            for die in cu.iter_DIEs()
+            if 'DW_AT_ranges' in die.attributes}
+        
+        rcus = list(range_lists_sec.iter_CUs()) if ver5 else None
+        rcu_index = 0
+        next_rcu_offset = 0
+
+        range_lists = list(range_lists_sec.iter_range_lists())
+        if len(range_lists) == 0:
+            # Present but empty ranges section - readelf outputs a message
+            self._emitline("\nSection '%s' has no debugging data." % section_name)
+            return
+
+        self._emitline('Contents of the %s section:\n\n\n' % section_name)
+        if not ver5:
+            self._emitline('    Offset   Begin    End')
+
+        for range_list in range_lists:
+            # Emit CU headers before the curernt rangelist
+            if ver5 and range_list[0].entry_offset > next_rcu_offset:
+                while range_list[0].entry_offset > next_rcu_offset:
+                    rcu = rcus[rcu_index]
+                    self._dump_debug_rnglists_CU_header(rcu)
+                    next_rcu_offset = rcu.offset_after_length + rcu.unit_length
+                    rcu_index += 1
+                self._emitline('    Offset   Begin    End')
+            self._dump_rangelist(range_list, cu_map, ver5, line_template, base_template, base_template_indexed, range_lists_sec)
+
+        # TODO: trailing empty CUs, if any?
+
+    def _dump_rangelist(self, range_list, cu_map, ver5, line_template, base_template, base_template_indexed, range_lists_sec):
+        # Weird discrepancy in binutils: for DWARFv5 it outputs entry offset,
+        # for DWARF<=4 list offset.
+        first = range_list[0]
+        base_ip = _get_cu_base(cu_map[first.entry_offset])
+        raw_v5_rangelist = None
+        for entry in range_list:
+            if isinstance(entry, RangeEntry):
                 postfix = ' (start == end)' if entry.begin_offset == entry.end_offset else ''
                 self._emitline(line_template % (
-                    entry.entry_offset,
-                    base_ip + entry.begin_offset,
-                    base_ip + entry.end_offset,
-                    expr,
+                    entry.entry_offset if ver5 else first.entry_offset,
+                    (0 if entry.is_absolute else base_ip) + entry.begin_offset,
+                    (0 if entry.is_absolute else base_ip) + entry.end_offset,
                     postfix))
-            # Pyelftools doesn't store the terminating entry,
-            # but readelf emits its offset, so this should too.
-            last = loc_list[-1]
-            last_len = 2*addr_size
-            if isinstance(last, LocationEntry):
-                last_len += 2 + len(last.loc_expr)
-            self._emitline("    %08x <End of list>" % (last.entry_offset + last_len))
+            elif isinstance(entry,RangeBaseAddressEntry):
+                base_ip = entry.base_address
+                # V5 base entries with index are reported differently in readelf - need to go back to the raw V5 format
+                # Maybe other subtypes too, but no such cases  in the test corpus
+                raw_v5_entry = None
+                if ver5:
+                    if not raw_v5_rangelist:
+                        raw_v5_rangelist = range_lists_sec.get_range_list_at_offset_ex(range_list[0].entry_offset)
+                    raw_v5_entry = next(re for re in raw_v5_rangelist if re.entry_offset == entry.entry_offset)
+                if raw_v5_entry and raw_v5_entry.entry_type == 'DW_RLE_base_addressx':
+                    self._emitline(base_template_indexed % (
+                        entry.entry_offset,
+                        raw_v5_entry.index,
+                        entry.base_address))
+                else:
+                    self._emitline(base_template % (
+                        entry.entry_offset if ver5 else first.entry_offset,
+                        entry.base_address))
+            else:
+                raise NotImplementedError("Unknown object in a range list")
+        last = range_list[-1]
+        self._emitline('    %08x <End of list>' % (last.entry_offset + last.entry_length if ver5 else first.entry_offset))
+
+    def _display_attributes(self, attr_sec, descriptor):
+        """ Display the attributes contained in the section.
+        """
+        for s in attr_sec.iter_subsections():
+            self._emitline("Attribute Section: %s" % s.header['vendor_name'])
+            for ss in s.iter_subsubsections():
+                h_val = "" if ss.header.extra is None else " ".join("%d" % x for x in ss.header.extra)
+                self._emitline(descriptor(ss.header.tag, h_val, None))
+
+                for attr in ss.iter_attributes():
+                    self._emit('  ')
+                    self._emitline(descriptor(attr.tag, attr.value, attr.extra))
 
     def _display_arch_specific_arm(self):
         """ Display the ARM architecture-specific info contained in the file.
         """
         attr_sec = self.elffile.get_section_by_name('.ARM.attributes')
+        self._display_attributes(attr_sec, describe_attr_tag_arm)
 
-        for s in attr_sec.iter_subsections():
-            self._emitline("Attribute Section: %s" % s.header['vendor_name'])
-            for ss in s.iter_subsubsections():
-                h_val = "" if ss.header.extra is None else " ".join("%d" % x for x in ss.header.extra)
-                self._emitline(describe_attr_tag_arm(ss.header.tag, h_val, None))
-
-                for attr in ss.iter_attributes():
-                    self._emit('  ')
-                    self._emitline(describe_attr_tag_arm(attr.tag,
-                                                         attr.value,
-                                                         attr.extra))
+    def _display_arch_specific_riscv(self):
+        """ Display the RISC-V architecture-specific info contained in the file.
+        """
+        attr_sec = self.elffile.get_section_by_name('.riscv.attributes')
+        self._display_attributes(attr_sec, describe_attr_tag_riscv)
 
     def _emit(self, s=''):
         """ Emit an object to output
@@ -1559,7 +1824,7 @@ def main(stream=None):
             action='store', dest='debug_dump_what', metavar='<what>',
             help=(
                 'Display the contents of DWARF debug sections. <what> can ' +
-                'one of {info,decodedline,frames,frames-interp,aranges,pubtypes,pubnames,loc}'))
+                'one of {info,decodedline,frames,frames-interp,aranges,pubtypes,pubnames,loc,Ranges}'))
     argparser.add_argument('--traceback',
                            action='store_true', dest='show_traceback',
                            help='Dump the Python traceback on ELFError'
