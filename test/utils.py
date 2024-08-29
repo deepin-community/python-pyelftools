@@ -22,8 +22,7 @@ def run_exe(exe_path, args=[], echo=False):
       print('[cmd]', ' '.join(popen_cmd))
     proc = subprocess.Popen(popen_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     proc_stdout = proc.communicate()[0]
-    from elftools.common.py3compat import bytes2str
-    return proc.returncode, bytes2str(proc_stdout)
+    return proc.returncode, proc_stdout.decode('latin-1')
 
 
 def is_in_rootdir():
@@ -32,13 +31,14 @@ def is_in_rootdir():
     return os.path.isdir('test') and os.path.isdir('elftools')
 
 
-def dump_output_to_temp_files(testlog, *args):
+def dump_output_to_temp_files(testlog, filename, option, *args):
     """ Dumps the output strings given in 'args' to temp files: one for each
-        arg.
+        arg. The filename and option arguments contribute to the file name,
+        so that one knows which test did the output dump come from.
     """
     for i, s in enumerate(args):
         fd, path = tempfile.mkstemp(
-                prefix='out' + str(i + 1) + '_',
+                prefix='out-%d-%s-%s-' % (i + 1, os.path.split(filename)[-1], option),
                 suffix='.stdout')
         file = os.fdopen(fd, 'w')
         file.write(s)

@@ -7,7 +7,6 @@
 # This code is in the public domain
 #-------------------------------------------------------------------------------
 from ..construct import Pass
-from ..common.py3compat import iteritems
 
 
 ENUM_DW_TAG = dict(
@@ -81,6 +80,10 @@ ENUM_DW_TAG = dict(
     DW_TAG_shared_type                 = 0x40,
     DW_TAG_type_unit                   = 0x41,
     DW_TAG_rvalue_reference_type       = 0x42,
+    DW_TAG_template_alias              = 0x43,
+    DW_TAG_coarray_type                = 0x44,
+    DW_TAG_generic_subrange            = 0x45,
+    DW_TAG_dynamic_type                = 0x46,    
     DW_TAG_atomic_type                 = 0x47,
     DW_TAG_call_site                   = 0x48,
     DW_TAG_call_site_parameter         = 0x49,
@@ -143,6 +146,8 @@ ENUM_DW_AT = dict(
     DW_AT_inline                    = 0x20,
     DW_AT_is_optional               = 0x21,
     DW_AT_lower_bound               = 0x22,
+    DW_AT_program                   = 0x23,
+    DW_AT_private                   = 0x24,
     DW_AT_producer                  = 0x25,
     DW_AT_protected                 = 0x26,
     DW_AT_prototyped                = 0x27,
@@ -152,6 +157,7 @@ ENUM_DW_AT = dict(
     DW_AT_bit_stride                = 0x2e,
     DW_AT_stride_size               = 0x2e,
     DW_AT_upper_bound               = 0x2f,
+    DW_AT_virtual                   = 0x30,
     DW_AT_abstract_origin           = 0x31,
     DW_AT_accessibility             = 0x32,
     DW_AT_address_class             = 0x33,
@@ -283,15 +289,21 @@ ENUM_DW_AT = dict(
     DW_AT_GNU_all_source_call_sites         = 0x2118,
     DW_AT_GNU_macros                        = 0x2119,
     DW_AT_GNU_deleted                       = 0x211a,
+    DW_AT_GNU_dwo_name                      = 0x2130,
     DW_AT_GNU_dwo_id                        = 0x2131,
+    DW_AT_GNU_ranges_base                   = 0x2132,
+    DW_AT_GNU_addr_base                     = 0x2133,
     DW_AT_GNU_pubnames                      = 0x2134,
     DW_AT_GNU_pubtypes                      = 0x2135,
     DW_AT_GNU_discriminator                 = 0x2136,
+    DW_AT_GNU_locviews                      = 0x2137,
+    DW_AT_GNU_entry_view                    = 0x2138,
 
     DW_AT_LLVM_include_path  = 0x3e00,
     DW_AT_LLVM_config_macros = 0x3e01,
-    DW_AT_LLVM_isysroot      = 0x3e02,
+    DW_AT_LLVM_isysroot      = 0x3e02, # sysroot elsewhere
     DW_AT_LLVM_tag_offset    = 0x3e03,
+    DW_AT_LLVM_apinotes      = 0x3e07,
 
     DW_AT_APPLE_optimized               = 0x3fe1,
     DW_AT_APPLE_flags                   = 0x3fe2,
@@ -306,6 +318,8 @@ ENUM_DW_AT = dict(
     DW_AT_APPLE_property_attribute      = 0x3feb,
     DW_AT_APPLE_objc_complete_type      = 0x3fec,
     DW_AT_APPLE_property                = 0x3fed,
+    DW_AT_APPLE_objc_direct             = 0x3fee,
+    DW_AT_APPLE_sdk                     = 0x3fef,
 
     _default_ = Pass,
 )
@@ -366,7 +380,7 @@ ENUM_DW_FORM = dict(
 )
 
 # Inverse mapping for ENUM_DW_FORM
-DW_FORM_raw2name = dict((v, k) for k, v in iteritems(ENUM_DW_FORM))
+DW_FORM_raw2name = dict((v, k) for k, v in ENUM_DW_FORM.items())
 
 # See http://www.airs.com/blog/archives/460
 DW_EH_encoding_flags = dict(
@@ -390,4 +404,136 @@ DW_EH_encoding_flags = dict(
     DW_EH_PE_indirect = 0x80,
 
     DW_EH_PE_omit     = 0xff,
+)
+
+ENUM_DW_LNCT = dict(
+    DW_LNCT_path             = 0x1,
+    DW_LNCT_directory_index  = 0x2,
+    DW_LNCT_timestamp        = 0x3,
+    DW_LNCT_size             = 0x4,
+    DW_LNCT_MD5              = 0x5,
+    DW_LNCT_lo_user          = 0x2000,
+    DW_LNCT_hi_user          = 0x3fff
+)
+
+ENUM_DW_UT = dict(
+    DW_UT_compile       = 0x01,
+    DW_UT_type          = 0x02,
+    DW_UT_partial       = 0x03,
+    DW_UT_skeleton      = 0x04,
+    DW_UT_split_compile = 0x05,
+    DW_UT_split_type    = 0x06,
+    DW_UT_lo_user       = 0x80,
+    DW_UT_hi_user       = 0xff
+)
+
+ENUM_DW_LLE = dict(
+    DW_LLE_end_of_list      = 0x00,
+    DW_LLE_base_addressx    = 0x01,
+    DW_LLE_startx_endx      = 0x02,
+    DW_LLE_startx_length    = 0x03,
+    DW_LLE_offset_pair      = 0x04,
+    DW_LLE_default_location = 0x05,
+    DW_LLE_base_address     = 0x06,
+    DW_LLE_start_end        = 0x07,
+    DW_LLE_start_length     = 0x08
+)
+
+ENUM_DW_RLE = dict(
+    DW_RLE_end_of_list   = 0x00,
+    DW_RLE_base_addressx = 0x01,
+    DW_RLE_startx_endx   = 0x02,
+    DW_RLE_startx_length = 0x03,
+    DW_RLE_offset_pair   = 0x04,
+    DW_RLE_base_address  = 0x05,
+    DW_RLE_start_end     = 0x06,
+    DW_RLE_start_length  = 0x07
+)
+
+ENUM_DW_LANG = dict(
+    DW_LANG_C89            = 0x0001,
+    DW_LANG_C              = 0x0002,
+    DW_LANG_Ada83          = 0x0003,
+    DW_LANG_C_plus_plus    = 0x0004,
+    DW_LANG_Cobol74        = 0x0005,
+    DW_LANG_Cobol85        = 0x0006,
+    DW_LANG_Fortran77      = 0x0007,
+    DW_LANG_Fortran90      = 0x0008,
+    DW_LANG_Pascal83       = 0x0009,
+    DW_LANG_Modula2        = 0x000a,
+    DW_LANG_Java           = 0x000b,
+    DW_LANG_C99            = 0x000c,
+    DW_LANG_Ada95          = 0x000d,
+    DW_LANG_Fortran95      = 0x000e,
+    DW_LANG_PLI            = 0x000f,
+    DW_LANG_ObjC           = 0x0010,
+    DW_LANG_ObjC_plus_plus = 0x0011,
+    DW_LANG_UPC            = 0x0012,
+    DW_LANG_D              = 0x0013,
+    DW_LANG_Python         = 0x0014,
+    DW_LANG_OpenCL         = 0x0015,
+    DW_LANG_Go             = 0x0016,
+    DW_LANG_Modula3        = 0x0017,
+    DW_LANG_Haskell        = 0x0018,
+    DW_LANG_C_plus_plus_03 = 0x0019,
+    DW_LANG_C_plus_plus_11 = 0x001a,
+    DW_LANG_OCaml          = 0x001b,
+    DW_LANG_Rust           = 0x001c,
+    DW_LANG_C11            = 0x001d,
+    DW_LANG_Swift          = 0x001e,
+    DW_LANG_Julia          = 0x001f,
+    DW_LANG_Dylan          = 0x0020,
+    DW_LANG_C_plus_plus_14 = 0x0021,
+    DW_LANG_Fortran03      = 0x0022,
+    DW_LANG_Fortran08      = 0x0023,
+    DW_LANG_RenderScript   = 0x0024,
+    DW_LANG_BLISS          = 0x0025,
+    DW_LANG_lo_user        = 0x8000,
+    DW_LANG_hi_user        = 0xffff
+)
+
+ENUM_DW_ATE = dict(
+    DW_ATE_address         = 0x01,
+    DW_ATE_boolean         = 0x02,
+    DW_ATE_complex_float   = 0x03,
+    DW_ATE_float           = 0x04,
+    DW_ATE_signed          = 0x05,
+    DW_ATE_signed_char     = 0x06,
+    DW_ATE_unsigned        = 0x07,
+    DW_ATE_unsigned_char   = 0x08,
+    DW_ATE_imaginary_float = 0x09,
+    DW_ATE_packed_decimal  = 0x0a,
+    DW_ATE_numeric_string  = 0x0b,
+    DW_ATE_edited          = 0x0c,
+    DW_ATE_signed_fixed    = 0x0d,
+    DW_ATE_unsigned_fixed  = 0x0e,
+    DW_ATE_decimal_float   = 0x0f,
+    DW_ATE_UTF             = 0x10,
+    DW_ATE_UCS             = 0x11,
+    DW_ATE_ASCII           = 0x12,
+    DW_ATE_lo_user         = 0x80,
+    DW_ATE_hi_user         = 0xff
+)
+
+ENUM_DW_ACCESS = dict(
+    DW_ACCESS_public    = 0x01,
+    DW_ACCESS_protected = 0x02,
+    DW_ACCESS_private   = 0x03
+)
+
+ENUM_DW_INL = dict(
+    DW_INL_not_inlined          = 0x00,
+    DW_INL_inlined              = 0x01,
+    DW_INL_declared_not_inlined = 0x02,
+    DW_INL_declared_inlined     = 0x03
+)
+
+ENUM_DW_CC = dict(
+    DW_CC_normal            = 0x01,
+    DW_CC_program           = 0x02,
+    DW_CC_nocall            = 0x03,
+    DW_CC_pass_by_reference = 0x04,
+    DW_CC_pass_by_value     = 0x05,
+    DW_CC_lo_user           = 0x40,
+    DW_CC_hi_user           = 0xff
 )

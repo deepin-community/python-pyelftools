@@ -3,11 +3,11 @@ Maintainer: Tomasz Buchert <tomasz@debian.org>
 Section: python
 Priority: optional
 Build-Depends: debhelper (>= 12),
-               debhelper-compat (= 12),
+               debhelper-compat (= 13),
                dh-python,
                python3,
                python3-setuptools
-Standards-Version: 4.5.0
+Standards-Version: 4.6.2
 Vcs-Browser: https://salsa.debian.org/debian/python-pyelftools
 Vcs-Git: https://salsa.debian.org/debian/python-pyelftools.git
 Homepage: https://github.com/eliben/pyelftools

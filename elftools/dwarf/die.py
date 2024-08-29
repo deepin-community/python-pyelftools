@@ -10,9 +10,9 @@ from collections import namedtuple, OrderedDict
 import os
 
 from ..common.exceptions import DWARFError
-from ..common.py3compat import bytes2str, iteritems
-from ..common.utils import struct_parse, preserve_stream_pos
+from ..common.utils import bytes2str, struct_parse, preserve_stream_pos
 from .enums import DW_FORM_raw2name
+from .dwarf_util import _resolve_via_offset_table, _get_base_offset
 
 
 # AttributeValue - describes an attribute value in the DIE:
@@ -35,8 +35,12 @@ from .enums import DW_FORM_raw2name
 #   Offset of this attribute's value in the stream (absolute offset, relative
 #   the beginning of the whole stream)
 #
+# indirection_length:
+#   If the form of the attribute is DW_FORM_indirect, the form will contain
+#   the resolved form, and this will contain the length of the indirection chain.
+#   0 means no indirection.
 AttributeValue = namedtuple(
-    'AttributeValue', 'name form value raw_value offset')
+    'AttributeValue', 'name form value raw_value offset indirection_length')
 
 
 class DIE(object):
@@ -63,7 +67,7 @@ class DIE(object):
 
             abbrev_code:
                 The abbreviation code pointing to an abbreviation entry (note
-                that this is for informational pusposes only - this object
+                that this is for informational purposes only - this object
                 interacts with its abbreviation table transparently).
 
         See also the public methods.
@@ -107,7 +111,7 @@ class DIE(object):
         """
         attr = self.attributes[name]
         if attr.form in ('DW_FORM_ref1', 'DW_FORM_ref2', 'DW_FORM_ref4',
-                         'DW_FORM_ref8', 'DW_FORM_ref'):
+                         'DW_FORM_ref8', 'DW_FORM_ref', 'DW_FORM_ref_udata'):
             refaddr = self.cu.cu_offset + attr.raw_value
             return self.cu.get_DIE_from_refaddr(refaddr)
         elif attr.form in ('DW_FORM_ref_addr'):
@@ -115,7 +119,10 @@ class DIE(object):
         elif attr.form in ('DW_FORM_ref_sig8'):
             # Implement search type units for matching signature
             raise NotImplementedError('%s (type unit by signature)' % attr.form)
-        elif attr.form in ('DW_FORM_ref_sup4', 'DW_FORM_ref_sup8'):
+        elif attr.form in ('DW_FORM_ref_sup4', 'DW_FORM_ref_sup8', 'DW_FORM_GNU_ref_alt'):
+            if self.dwarfinfo.supplementary_dwarfinfo:
+                return self.dwarfinfo.supplementary_dwarfinfo.get_DIE_from_refaddr(attr.raw_value)
+            # FIXME: how to distinguish supplementary files from dwo ?
             raise NotImplementedError('%s to dwo' % attr.form)
         else:
             raise DWARFError('%s is not a reference class form attribute' % attr)
@@ -206,7 +213,7 @@ class DIE(object):
     def __repr__(self):
         s = 'DIE %s, size=%s, has_children=%s\n' % (
             self.tag, self.size, self.has_children)
-        for attrname, attrval in iteritems(self.attributes):
+        for attrname, attrval in self.attributes.items():
             s += '    |%-18s:  %s\n' % (attrname, attrval)
         return s
 
@@ -237,43 +244,115 @@ class DIE(object):
 
         # Guided by the attributes listed in the abbreviation declaration, parse
         # values from the stream.
-        for name, form in abbrev_decl.iter_attr_specs():
+        for spec in abbrev_decl['attr_spec']:
+            form = spec.form
+            name = spec.name
             attr_offset = self.stream.tell()
-            raw_value = struct_parse(structs.Dwarf_dw_form[form], self.stream)
-
-            value = self._translate_attr_value(form, raw_value)
+            indirection_length = 0
+            # Special case here: the attribute value is stored in the attribute
+            # definition in the abbreviation spec, not in the DIE itself.
+            if form == 'DW_FORM_implicit_const':
+                value = spec.value
+                raw_value = value
+            # Another special case: the attribute value is a form code followed by the real value in that form
+            elif form == 'DW_FORM_indirect':
+                (form, raw_value, indirection_length) = self._resolve_indirect()
+                value = self._translate_attr_value(form, raw_value)
+            else:
+                raw_value = struct_parse(structs.Dwarf_dw_form[form], self.stream)
+                value = self._translate_attr_value(form, raw_value)
             self.attributes[name] = AttributeValue(
                 name=name,
                 form=form,
                 value=value,
                 raw_value=raw_value,
-                offset=attr_offset)
+                offset=attr_offset,
+                indirection_length = indirection_length)
 
         self.size = self.stream.tell() - self.offset
+
+    def _resolve_indirect(self):
+        # Supports arbitrary indirection nesting (the standard doesn't prohibit that).
+        # Expects the stream to be at the real form.
+        # Returns (form, raw_value, length).
+        structs = self.cu.structs
+        length = 1
+        real_form_code = struct_parse(structs.Dwarf_uleb128(''), self.stream) # Numeric form code
+        while True:
+            try:
+                real_form = DW_FORM_raw2name[real_form_code] # Form name or exception if bogus code
+            except KeyError as err:
+                raise DWARFError('Found DW_FORM_indirect with unknown real form 0x%x' % real_form_code)
+            
+            raw_value = struct_parse(structs.Dwarf_dw_form[real_form], self.stream)
+            
+            if real_form != 'DW_FORM_indirect': # Happy path: one level of indirection
+                return (real_form, raw_value, length)
+            else: # Indirection cascade
+                length += 1
+                real_form_code = raw_value
+                # And continue parsing
+            # No explicit infinite loop guard because the stream will end eventually
 
     def _translate_attr_value(self, form, raw_value):
         """ Translate a raw attr value according to the form
         """
+        # Indirect forms can only be parsed if the top DIE of this CU has already been parsed
+        # and listed in the CU, since the top DIE would have to contain the DW_AT_xxx_base attributes.
+        # This breaks if there is an indirect encoding in the top DIE itself before the
+        # corresponding _base, and it was seen in the wild.
+        # There is a hook in get_top_DIE() to resolve those lazily.
+        translate_indirect = self.cu.has_top_DIE() or self.offset != self.cu.cu_die_offset        
         value = None
         if form == 'DW_FORM_strp':
             with preserve_stream_pos(self.stream):
                 value = self.dwarfinfo.get_string_from_table(raw_value)
+        elif form == 'DW_FORM_line_strp':
+            with preserve_stream_pos(self.stream):
+                value = self.dwarfinfo.get_string_from_linetable(raw_value)
+        elif form in ('DW_FORM_GNU_strp_alt', 'DW_FORM_strp_sup'):
+            if self.dwarfinfo.supplementary_dwarfinfo:
+                return self.dwarfinfo.supplementary_dwarfinfo.get_string_from_table(raw_value)
+            else:
+                value = raw_value
         elif form == 'DW_FORM_flag':
             value = not raw_value == 0
         elif form == 'DW_FORM_flag_present':
             value = True
-        elif form == 'DW_FORM_indirect':
-            try:
-                form = DW_FORM_raw2name[raw_value]
-            except KeyError as err:
-                raise DWARFError(
-                        'Found DW_FORM_indirect with unknown raw_value=' +
-                        str(raw_value))
-
-            raw_value = struct_parse(
-                self.cu.structs.Dwarf_dw_form[form], self.stream)
-            # Let's hope this doesn't get too deep :-)
-            return self._translate_attr_value(form, raw_value)
+        elif form in ('DW_FORM_addrx', 'DW_FORM_addrx1', 'DW_FORM_addrx2', 'DW_FORM_addrx3', 'DW_FORM_addrx4') and translate_indirect:
+            value = self.cu.dwarfinfo.get_addr(self.cu, raw_value)
+        elif form in ('DW_FORM_strx', 'DW_FORM_strx1', 'DW_FORM_strx2', 'DW_FORM_strx3', 'DW_FORM_strx4') and translate_indirect:
+            stream = self.dwarfinfo.debug_str_offsets_sec.stream
+            base_offset = _get_base_offset(self.cu, 'DW_AT_str_offsets_base')
+            offset_size = 4 if self.cu.structs.dwarf_format == 32 else 8
+            with preserve_stream_pos(stream):
+                str_offset = struct_parse(self.cu.structs.Dwarf_offset(''), stream, base_offset + raw_value*offset_size)
+            value = self.dwarfinfo.get_string_from_table(str_offset)
+        elif form == 'DW_FORM_loclistx' and translate_indirect:
+            value = _resolve_via_offset_table(self.dwarfinfo.debug_loclists_sec.stream, self.cu, raw_value, 'DW_AT_loclists_base')
+        elif form == 'DW_FORM_rnglistx' and translate_indirect:
+            value = _resolve_via_offset_table(self.dwarfinfo.debug_rnglists_sec.stream, self.cu, raw_value, 'DW_AT_rnglists_base')
         else:
             value = raw_value
         return value
+
+    def _translate_indirect_attributes(self):
+        """ This is a hook to translate the DW_FORM_...x values in the top DIE
+            once the top DIE is parsed to the end. They can't be translated 
+            while the top DIE is being parsed, because they implicitly make a
+            reference to the DW_AT_xxx_base attribute in the same DIE that may
+            not have been parsed yet.
+        """
+        for key in self.attributes:
+            attr = self.attributes[key]
+            if attr.form in ('DW_FORM_strx', 'DW_FORM_strx1', 'DW_FORM_strx2', 'DW_FORM_strx3', 'DW_FORM_strx4',
+                'DW_FORM_addrx', 'DW_FORM_addrx1', 'DW_FORM_addrx2', 'DW_FORM_addrx3', 'DW_FORM_addrx4',
+                'DW_FORM_loclistx', 'DW_FORM_rnglistx'):
+                # Can't change value in place, got to replace the whole attribute record
+                self.attributes[key] = AttributeValue(
+                    name=attr.name,
+                    form=attr.form,
+                    value=self._translate_attr_value(attr.form, attr.raw_value),
+                    raw_value=attr.raw_value,
+                    offset=attr.offset,
+                    indirection_length=attr.indirection_length)

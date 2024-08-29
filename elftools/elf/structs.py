@@ -11,9 +11,11 @@ from ..construct import (
     UBInt8, UBInt16, UBInt32, UBInt64,
     ULInt8, ULInt16, ULInt32, ULInt64,
     SBInt32, SLInt32, SBInt64, SLInt64,
-    Struct, Array, Enum, Padding, BitStruct, BitField, Value, String, CString
+    Struct, Array, Enum, Padding, BitStruct, BitField, Value, String, CString,
+    Switch, Field
     )
 from ..common.construct_utils import ULEB128
+from ..common.utils import roundup
 from .enums import *
 
 
@@ -102,9 +104,12 @@ class ELFStructs(object):
         self._create_gnu_verdef()
         self._create_gnu_versym()
         self._create_gnu_abi()
+        self._create_gnu_property()
         self._create_note(e_type)
         self._create_stabs()
+        self._create_attributes_subsection()
         self._create_arm_attributes()
+        self._create_riscv_attributes()
         self._create_elf_hash()
         self._create_gnu_hash()
 
@@ -150,6 +155,8 @@ class ELFStructs(object):
             p_type_dict = ENUM_P_TYPE_AARCH64
         elif self.e_machine == 'EM_MIPS':
             p_type_dict = ENUM_P_TYPE_MIPS
+        elif self.e_machine == 'EM_RISCV':
+            p_type_dict = ENUM_P_TYPE_RISCV
 
         if self.elfclass == 32:
             self.Elf_Phdr = Struct('Elf_Phdr',
@@ -186,6 +193,8 @@ class ELFStructs(object):
             sh_type_dict = ENUM_SH_TYPE_AMD64
         elif self.e_machine == 'EM_MIPS':
             sh_type_dict = ENUM_SH_TYPE_MIPS
+        if self.e_machine == 'EM_RISCV':
+            sh_type_dict = ENUM_SH_TYPE_RISCV
 
         self.Elf_Shdr = Struct('Elf_Shdr',
             self.Elf_word('sh_name'),
@@ -267,6 +276,12 @@ class ELFStructs(object):
                                *fields_and_addend
         )
 
+        # Elf32_Relr is typedef'd as Elf32_Word, Elf64_Relr as Elf64_Xword
+        # (see the glibc patch, for example:
+        # https://sourceware.org/pipermail/libc-alpha/2021-October/132029.html)
+        # For us, this is the same as self.Elf_addr (or self.Elf_xword).
+        self.Elf_Relr = Struct('Elf_Relr', self.Elf_addr('r_offset'))
+
     def _create_dyn(self):
         d_tag_dict = dict(ENUM_D_TAG_COMMON)
         if self.e_machine in ENUMMAP_EXTRA_D_TAG_MACHINE:
@@ -289,7 +304,10 @@ class ELFStructs(object):
         # st_other is hierarchical. To access the visibility,
         # use container['st_other']['visibility']
         st_other_struct = BitStruct('st_other',
-            Padding(5),
+            # https://openpowerfoundation.org/wp-content/uploads/2016/03/ABI64BitOpenPOWERv1.1_16July2015_pub4.pdf
+            # See 3.4.1 Symbol Values.
+            Enum(BitField('local', 3), **ENUM_ST_LOCAL),
+            Padding(2),
             Enum(BitField('visibility', 3), **ENUM_ST_VISIBILITY))
         if self.elfclass == 32:
             self.Elf_Sym = Struct('Elf_Sym',
@@ -368,8 +386,58 @@ class ELFStructs(object):
             self.Elf_word('abi_tiny'),
         )
 
+    def _create_gnu_debugaltlink(self):
+        self.Elf_debugaltlink = Struct('Elf_debugaltlink',
+            CString("sup_filename"),
+            String("sup_checksum", length=20))
+
+    def _create_gnu_property(self):
+        # Structure of GNU property notes is documented in
+        # https://github.com/hjl-tools/linux-abi/wiki/linux-abi-draft.pdf
+        def roundup_padding(ctx):
+            if self.elfclass == 32:
+                return roundup(ctx.pr_datasz, 2) - ctx.pr_datasz
+            return roundup(ctx.pr_datasz, 3) - ctx.pr_datasz
+
+        def classify_pr_data(ctx):
+            if type(ctx.pr_type) is not str:
+                return None
+            if ctx.pr_type.startswith('GNU_PROPERTY_X86_'):
+                return ('GNU_PROPERTY_X86_*', 4, 0)
+            elif ctx.pr_type.startswith('GNU_PROPERTY_AARCH64_'):
+                return ('GNU_PROPERTY_AARCH64_*', 4, 0)            
+            return (ctx.pr_type, ctx.pr_datasz, self.elfclass)
+
+        self.Elf_Prop = Struct('Elf_Prop',
+            Enum(self.Elf_word('pr_type'), **ENUM_NOTE_GNU_PROPERTY_TYPE),
+            self.Elf_word('pr_datasz'),
+            Switch('pr_data', classify_pr_data, {
+                    ('GNU_PROPERTY_STACK_SIZE', 4, 32): self.Elf_word('pr_data'),
+                    ('GNU_PROPERTY_STACK_SIZE', 8, 64): self.Elf_word64('pr_data'),
+                    ('GNU_PROPERTY_X86_*', 4, 0): self.Elf_word('pr_data'),
+                    ('GNU_PROPERTY_AARCH64_*', 4, 0): self.Elf_word('pr_data'),
+                },
+                default=Field('pr_data', lambda ctx: ctx.pr_datasz)
+            ),
+            Padding(roundup_padding)
+        )
+
     def _create_note(self, e_type=None):
         # Structure of "PT_NOTE" section
+
+        self.Elf_ugid = self.Elf_half if self.elfclass == 32 and self.e_machine in {
+            'EM_MN10300',
+            'EM_ARM',
+            'EM_CRIS',
+            'EM_CYGNUS_FRV',
+            'EM_386',
+            'EM_M32R',
+            'EM_68K',
+            'EM_S390',
+            'EM_SH',
+            'EM_SPARC',
+        } else self.Elf_word
+
         self.Elf_Nhdr = Struct('Elf_Nhdr',
             self.Elf_word('n_namesz'),
             self.Elf_word('n_descsz'),
@@ -387,12 +455,12 @@ class ELFStructs(object):
                 self.Elf_byte('pr_zomb'),
                 self.Elf_byte('pr_nice'),
                 self.Elf_xword('pr_flag'),
-                self.Elf_half('pr_uid'),
-                self.Elf_half('pr_gid'),
-                self.Elf_half('pr_pid'),
-                self.Elf_half('pr_ppid'),
-                self.Elf_half('pr_pgrp'),
-                self.Elf_half('pr_sid'),
+                self.Elf_ugid('pr_uid'),
+                self.Elf_ugid('pr_gid'),
+                self.Elf_word('pr_pid'),
+                self.Elf_word('pr_ppid'),
+                self.Elf_word('pr_pgrp'),
+                self.Elf_word('pr_sid'),
                 String('pr_fname', 16),
                 String('pr_psargs', 80),
             )
@@ -404,8 +472,8 @@ class ELFStructs(object):
                 self.Elf_byte('pr_nice'),
                 Padding(4),
                 self.Elf_xword('pr_flag'),
-                self.Elf_word('pr_uid'),
-                self.Elf_word('pr_gid'),
+                self.Elf_ugid('pr_uid'),
+                self.Elf_ugid('pr_gid'),
                 self.Elf_word('pr_pid'),
                 self.Elf_word('pr_ppid'),
                 self.Elf_word('pr_pgrp'),
@@ -440,7 +508,7 @@ class ELFStructs(object):
             self.Elf_word('n_value'),
         )
 
-    def _create_arm_attributes(self):
+    def _create_attributes_subsection(self):
         # Structure of a build attributes subsection header. A subsection is
         # either public to all tools that process the ELF file or private to
         # the vendor's tools.
@@ -450,10 +518,18 @@ class ELFStructs(object):
                                                                encoding='utf-8')
         )
 
-        # Structure of a build attribute tag.
-        self.Elf_Attribute_Tag = Struct('Elf_Attribute_Tag',
+    def _create_arm_attributes(self):
+        # Structure of an ARM build attribute tag.
+        self.Elf_Arm_Attribute_Tag = Struct('Elf_Arm_Attribute_Tag',
+                                             Enum(self.Elf_uleb128('tag'),
+                                                  **ENUM_ATTR_TAG_ARM)
+        )
+
+    def _create_riscv_attributes(self):
+        # Structure of a RISC-V build attribute tag.
+        self.Elf_RiscV_Attribute_Tag = Struct('Elf_RiscV_Attribute_Tag',
                                         Enum(self.Elf_uleb128('tag'),
-                                             **ENUM_ATTR_TAG_ARM)
+                                             **ENUM_ATTR_TAG_RISCV)
         )
 
     def _create_elf_hash(self):

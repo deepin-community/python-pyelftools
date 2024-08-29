@@ -1,5 +1,8 @@
 # the file is a binary to showcase the module
-python-pyelftools source: source-contains-prebuilt-binary examples/sample_exe64.elf
-python-pyelftools source: source-is-missing examples/sample_exe64.elf
+source-is-missing [examples/*]
 # these files are used for tests
-python-pyelftools source: source-is-missing test/*
+source-is-missing [test/*]
+binary-with-bad-dynamic-table [test/*]
+elf-error * [test/*]
+# The test file causes issues, see #1068177@.
+unpack-message-for-orig * Output from 'readelf --all --wide */dwarf_phantombytes.elf' is not valid UTF-8

@@ -11,8 +11,7 @@ from collections import defaultdict
 from .constants import *
 from .dwarf_expr import DWARFExprParser
 from .die import DIE
-from ..common.utils import preserve_stream_pos, dwarf_assert
-from ..common.py3compat import bytes2str
+from ..common.utils import preserve_stream_pos, dwarf_assert, bytes2str
 from .callframe import instruction_name, CIE, FDE
 
 
@@ -90,7 +89,7 @@ def describe_CFI_instructions(entry):
                 name, factored_offset, factored_offset + pc)
             pc += factored_offset
         elif name in (  'DW_CFA_remember_state', 'DW_CFA_restore_state',
-                        'DW_CFA_nop'):
+                        'DW_CFA_nop', 'DW_CFA_AARCH64_negate_ra_state'):
             s += '  %s\n' % name
         elif name == 'DW_CFA_def_cfa':
             s += '  %s: %s ofs %s\n' % (
@@ -184,27 +183,37 @@ def describe_form_class(form):
 #
 _MACHINE_ARCH = None
 
+# Implements the alternative format of readelf: lowercase hex, prefixed with 0x unless 0
+def _format_hex(n):
+    return '0x%x' % n if n != 0 else '0'
 
 def _describe_attr_ref(attr, die, section_offset):
-    return '<0x%x>' % (attr.value + die.cu.cu_offset)
+    return '<%s>' % _format_hex(attr.value + die.cu.cu_offset)
+
+def _describe_attr_ref_sig8(attr, die, section_offset):
+    return 'signature: %s' % _format_hex(attr.value)
 
 def _describe_attr_value_passthrough(attr, die, section_offset):
     return attr.value
 
 def _describe_attr_hex(attr, die, section_offset):
-    return '0x%x' % (attr.value)
+    return '%s' % _format_hex(attr.value)
 
 def _describe_attr_hex_addr(attr, die, section_offset):
-    return '<0x%x>' % (attr.value)
+    return '<%s>' % _format_hex(attr.value)
 
 def _describe_attr_split_64bit(attr, die, section_offset):
     low_word = attr.value & 0xFFFFFFFF
     high_word = (attr.value >> 32) & 0xFFFFFFFF
-    return '0x%x 0x%x' % (low_word, high_word)
+    return '%s %s' % (_format_hex(low_word), _format_hex(high_word))
 
 def _describe_attr_strp(attr, die, section_offset):
-    return '(indirect string, offset: 0x%x): %s' % (
-        attr.raw_value, bytes2str(attr.value))
+    return '(indirect string, offset: %s): %s' % (
+        _format_hex(attr.raw_value), bytes2str(attr.value))
+
+def _describe_attr_line_strp(attr, die, section_offset):
+    return '(indirect line string, offset: %s): %s' % (
+        _format_hex(attr.raw_value), bytes2str(attr.value))
 
 def _describe_attr_string(attr, die, section_offset):
     return bytes2str(attr.value)
@@ -247,13 +256,14 @@ _ATTR_DESCRIPTION_MAP = defaultdict(
     DW_FORM_udata=_describe_attr_value_passthrough,
     DW_FORM_string=_describe_attr_string,
     DW_FORM_strp=_describe_attr_strp,
+    DW_FORM_line_strp=_describe_attr_line_strp,
     DW_FORM_block1=_describe_attr_block,
     DW_FORM_block2=_describe_attr_block,
     DW_FORM_block4=_describe_attr_block,
     DW_FORM_block=_describe_attr_block,
     DW_FORM_flag_present=_describe_attr_present,
     DW_FORM_exprloc=_describe_attr_block,
-    DW_FORM_ref_sig8=_describe_attr_ref,
+    DW_FORM_ref_sig8=_describe_attr_ref_sig8,
 )
 
 _FORM_CLASS = dict(
@@ -312,12 +322,29 @@ _DESCR_DW_LANG = {
     DW_LANG_UPC: '(Unified Parallel C)',
     DW_LANG_D: '(D)',
     DW_LANG_Python: '(Python)',
+    DW_LANG_OpenCL: '(OpenCL)',
+    DW_LANG_Go: '(Go)',
+    DW_LANG_Modula3: '(Modula 3)',
+    DW_LANG_Haskell: '(Haskell)',
+    DW_LANG_C_plus_plus_03: '(C++03)',
+    DW_LANG_C_plus_plus_11: '(C++11)',
+    DW_LANG_OCaml: '(OCaml)',
+    DW_LANG_Rust: '(Rust)',
+    DW_LANG_C11: '(C11)',
+    DW_LANG_Swift: '(Swift)',
+    DW_LANG_Julia: '(Julia)',
+    DW_LANG_Dylan: '(Dylan)',
+    DW_LANG_C_plus_plus_14: '(C++14)',
+    DW_LANG_Fortran03: '(Fortran 03)',
+    DW_LANG_Fortran08: '(Fortran 08)',
+    DW_LANG_RenderScript: '(RenderScript)',
+    DW_LANG_BLISS: '(Bliss)', # Not in binutils
     DW_LANG_Mips_Assembler: '(MIPS assembler)',
     DW_LANG_HP_Bliss: '(HP Bliss)',
     DW_LANG_HP_Basic91: '(HP Basic 91)',
     DW_LANG_HP_Pascal91: '(HP Pascal 91)',
     DW_LANG_HP_IMacro: '(HP IMacro)',
-    DW_LANG_HP_Assembler: '(HP assembler)',
+    DW_LANG_HP_Assembler: '(HP assembler)'
 }
 
 _DESCR_DW_ATE = {
@@ -376,6 +403,8 @@ _DESCR_DW_CC = {
     DW_CC_normal: '(normal)',
     DW_CC_program: '(program)',
     DW_CC_nocall: '(nocall)',
+    DW_CC_pass_by_reference: '(pass by ref)',
+    DW_CC_pass_by_valuee: '(pass by value)',
 }
 
 _DESCR_DW_ORD = {
@@ -432,10 +461,9 @@ def _data_member_location_extra(attr, die, section_offset):
     # can be an integer offset, or a location description.
     #
     if attr.form in ('DW_FORM_data1', 'DW_FORM_data2',
-                     'DW_FORM_data4', 'DW_FORM_data8'):
+                     'DW_FORM_data4', 'DW_FORM_data8',
+                     'DW_FORM_sdata'):
         return ''  # No extra description needed
-    elif attr.form == 'DW_FORM_sdata':
-        return str(attr.value)
     else:
         return describe_DWARF_expr(attr.value, die.cu.structs, die.cu.cu_offset)
 
@@ -501,6 +529,7 @@ _EXTRA_INFO_DESCRIPTION_MAP = defaultdict(
     DW_AT_associated=_location_list_extra,
     DW_AT_data_location=_location_list_extra,
     DW_AT_stride=_location_list_extra,
+    DW_AT_call_value=_location_list_extra,
     DW_AT_import=_import_extra,
     DW_AT_GNU_call_site_value=_location_list_extra,
     DW_AT_GNU_call_site_data_value=_location_list_extra,
@@ -530,12 +559,24 @@ _REG_NAMES_x64 = [
     'mxcsr', 'fcw', 'fsw'
 ]
 
-# https://developer.arm.com/docs/ihi0057/c/dwarf-for-the-arm-64-bit-architecture-aarch64-abi-2018q4#id24
+# https://developer.arm.com/documentation/ihi0057/e/?lang=en#dwarf-register-names
 _REG_NAMES_AArch64 = [
-    'x0', 'x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'x9',
-    'x10', 'x11', 'x12', 'x13', 'x14', 'x15', 'x16', 'x17', 'x18', 'x19',
-    'x20', 'x21', 'x22', 'x23', 'x24', 'x25', 'x26', 'x27', 'x28', 'x29',
-    'x30', 'sp'
+    'x0', 'x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7',
+    'x8', 'x9', 'x10', 'x11', 'x12', 'x13', 'x14', 'x15',
+    'x16', 'x17', 'x18', 'x19', 'x20', 'x21', 'x22', 'x23',
+    'x24', 'x25', 'x26', 'x27', 'x28', 'x29', 'x30', 'sp',
+    '<none>', 'ELR_mode', 'RA_SIGN_STATE', '<none>', '<none>', '<none>', '<none>', '<none>',
+    '<none>', '<none>', '<none>', '<none>', '<none>', '<none>', 'VG', 'FFR',
+    'p0', 'p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7',
+    'p8', 'p9', 'p10', 'p11', 'p12', 'p13', 'p14', 'p15',
+    'v0', 'v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'v7',
+    'v8', 'v9', 'v10', 'v11', 'v12', 'v13', 'v14', 'v15',
+    'v16', 'v17', 'v18', 'v19', 'v20', 'v21', 'v22', 'v23',
+    'v24', 'v25', 'v26', 'v27', 'v28', 'v29', 'v30', 'v31',
+    'z0', 'z1', 'z2', 'z3', 'z4', 'z5', 'z6', 'z7',
+    'z8', 'z9', 'z10', 'z11', 'z12', 'z13', 'z14', 'z15',
+    'z16', 'z17', 'z18', 'z19', 'z20', 'z21', 'z22', 'z23',
+    'z24', 'z25', 'z26', 'z27', 'z28', 'z29', 'z30', 'z31'
 ]
 
 
@@ -617,21 +658,21 @@ class ExprDumper(object):
             return '%s: %x' % (opcode_name, args[0])
         elif opcode_name in self._ops_with_two_decimal_args:
             return '%s: %s %s' % (opcode_name, args[0], args[1])
-        elif opcode_name == 'DW_OP_GNU_entry_value':
-            return '%s: (%s)' % (opcode_name, ','.join([self._dump_to_string(deo.op, deo.op_name, deo.args) for deo in args[0]]))
+        elif opcode_name in ('DW_OP_GNU_entry_value', 'DW_OP_entry_value'):
+            return '%s: (%s)' % (opcode_name, ','.join([self._dump_to_string(deo.op, deo.op_name, deo.args, cu_offset) for deo in args[0]]))
         elif opcode_name == 'DW_OP_implicit_value':
             return "%s %s byte block: %s" % (opcode_name, len(args[0]), ''.join(["%x " % b for b in args[0]]))
         elif opcode_name == 'DW_OP_GNU_parameter_ref':
             return "%s: <0x%x>" % (opcode_name, args[0] + cu_offset)
-        elif opcode_name == 'DW_OP_GNU_implicit_pointer':
+        elif opcode_name in ('DW_OP_GNU_implicit_pointer', 'DW_OP_implicit_pointer'):
             return "%s: <0x%x> %d" % (opcode_name, args[0], args[1])
-        elif opcode_name == 'DW_OP_GNU_convert':
+        elif opcode_name in ('DW_OP_GNU_convert', 'DW_OP_convert'):
             return "%s <0x%x>" % (opcode_name, args[0] + cu_offset)
-        elif opcode_name == 'DW_OP_GNU_deref_type':
+        elif opcode_name in ('DW_OP_GNU_deref_type', 'DW_OP_deref_type'):
             return "%s: %d <0x%x>" % (opcode_name, args[0], args[1] + cu_offset)
-        elif opcode_name == 'DW_OP_GNU_const_type':
+        elif opcode_name in ('DW_OP_GNU_const_type', 'DW_OP_const_type'):
             return "%s: <0x%x>  %d byte block: %s " % (opcode_name, args[0] + cu_offset, len(args[1]), ' '.join("%x" % b for b in args[1]))
-        elif opcode_name == 'DW_OP_GNU_regval_type':
+        elif opcode_name in ('DW_OP_GNU_regval_type', 'DW_OP_regval_type'):
             return "%s: %d (%s) <0x%x>" % (opcode_name, args[0], describe_reg_name(args[0], _MACHINE_ARCH), args[1] + cu_offset)
         else:
             return '<unknown %s>' % opcode_name

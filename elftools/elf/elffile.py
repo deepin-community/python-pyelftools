@@ -7,6 +7,8 @@
 # This code is in the public domain
 #-------------------------------------------------------------------------------
 import io
+from io import BytesIO
+import os
 import struct
 import zlib
 
@@ -22,16 +24,16 @@ except ImportError:
         # Jython
         PAGESIZE = 4096
 
-from ..common.py3compat import BytesIO
-from ..common.exceptions import ELFError
+from ..common.exceptions import ELFError, ELFParseError
 from ..common.utils import struct_parse, elf_assert
 from .structs import ELFStructs
 from .sections import (
         Section, StringTableSection, SymbolTableSection,
         SymbolTableIndexSection, SUNWSyminfoTableSection, NullSection,
-        NoteSection, StabSection, ARMAttributesSection)
+        NoteSection, StabSection, ARMAttributesSection, RISCVAttributesSection)
 from .dynamic import DynamicSection, DynamicSegment
-from .relocation import RelocationSection, RelocationHandler
+from .relocation import (RelocationSection, RelocationHandler,
+        RelrRelocationSection)
 from .gnuversions import (
         GNUVerNeedSection, GNUVerDefSection,
         GNUVerSymSection)
@@ -44,6 +46,12 @@ from .constants import SHN_INDICES
 class ELFFile(object):
     """ Creation: the constructor accepts a stream (file-like object) with the
         contents of an ELF file.
+
+        Optionally, a stream_loader function can be passed as the second
+        argument. This stream_loader function takes a relative file path to
+        load a supplementary object file, and returns a stream suitable for
+        creating a new ELFFile. Currently, the only such relative file path is
+        obtained from the supplementary object files.
 
         Accessible attributes:
 
@@ -68,8 +76,11 @@ class ELFFile(object):
             e_ident_raw:
                 the raw e_ident field of the header
     """
-    def __init__(self, stream):
+    def __init__(self, stream, stream_loader=None):
         self.stream = stream
+        self.stream.seek(0, io.SEEK_END)
+        self.stream_len = self.stream.tell()
+
         self._identify_file()
         self.structs = ELFStructs(
             little_endian=self.little_endian,
@@ -87,6 +98,23 @@ class ELFFile(object):
         self._section_header_stringtable = \
             self._get_section_header_stringtable()
         self._section_name_map = None
+        self.stream_loader = stream_loader
+
+    @classmethod
+    def load_from_path(cls, path):
+        """Takes a path to a file on the local filesystem, and returns an
+        ELFFile from it, setting up a correct stream_loader relative to the
+        original file.
+        """
+        base_directory = os.path.dirname(path)
+        def loader(elf_path):
+            # FIXME: use actual path instead of str/bytes
+            if not os.path.isabs(elf_path):
+                elf_path = os.path.join(base_directory,
+                                        elf_path)
+            return open(elf_path, 'rb')
+        stream = open(path, 'rb')
+        return ELFFile(stream, loader)
 
     def num_sections(self):
         """ Number of sections in the file
@@ -120,17 +148,32 @@ class ELFFile(object):
         # mapping
         #
         if self._section_name_map is None:
-            self._section_name_map = {}
-            for i, sec in enumerate(self.iter_sections()):
-                self._section_name_map[sec.name] = i
+            self._make_section_name_map()
         secnum = self._section_name_map.get(name, None)
         return None if secnum is None else self.get_section(secnum)
 
-    def iter_sections(self):
-        """ Yield all the sections in the file
+    def get_section_index(self, section_name):
+        """ Gets the index of the section by name. Return None if no such
+            section name exists.
+        """
+        # The first time this method is called, construct a name to number
+        # mapping
+        #
+        if self._section_name_map is None:
+            self._make_section_name_map()
+        return self._section_name_map.get(section_name, None)
+
+    def iter_sections(self, type=None):
+        """ Yield all the sections in the file. If the optional |type|
+            parameter is passed, this method will only yield sections of the
+            given type. The parameter value must be a string containing the
+            name of the type as defined in the ELF specification, e.g.
+            'SHT_SYMTAB'.
         """
         for i in range(self.num_sections()):
-            yield self.get_section(i)
+            section = self.get_section(i)
+            if type is None or section['sh_type'] == type:
+                yield section
 
     def num_segments(self):
         """ Number of segments in the file
@@ -153,11 +196,17 @@ class ELFFile(object):
         segment_header = self._get_segment_header(n)
         return self._make_segment(segment_header)
 
-    def iter_segments(self):
-        """ Yield all the segments in the file
+    def iter_segments(self, type=None):
+        """ Yield all the segments in the file. If the optional |type|
+            parameter is passed, this method will only yield segments of the
+            given type. The parameter value must be a string containing the
+            name of the type as defined in the ELF specification, e.g.
+            'PT_LOAD'.
         """
         for i in range(self.num_segments()):
-            yield self.get_segment(i)
+            segment = self.get_segment(i)
+            if type is None or segment['p_type'] == type:
+                yield segment
 
     def address_offsets(self, start, size=1):
         """ Yield a file offset for each ELF segment containing a memory region.
@@ -166,10 +215,8 @@ class ELFFile(object):
             offset of the region is yielded.
         """
         end = start + size
-        for seg in self.iter_segments():
-            # consider LOAD only to prevent same address being yielded twice
-            if seg['p_type'] != 'PT_LOAD':
-                continue
+        # consider LOAD only to prevent same address being yielded twice
+        for seg in self.iter_segments(type='PT_LOAD'):
             if (start >= seg['p_vaddr'] and
                 end <= seg['p_vaddr'] + seg['p_filesz']):
                 yield start - seg['p_vaddr'] + seg['p_offset']
@@ -183,12 +230,15 @@ class ELFFile(object):
             self.get_section_by_name('.zdebug_info') or
             self.get_section_by_name('.eh_frame'))
 
-    def get_dwarf_info(self, relocate_dwarf_sections=True):
+    def get_dwarf_info(self, relocate_dwarf_sections=True, follow_links=True):
         """ Return a DWARFInfo object representing the debugging information in
             this file.
 
             If relocate_dwarf_sections is True, relocations for DWARF sections
             are looked up and applied.
+
+            If follow_links is True, we will try to load the supplementary
+            object file (if any), and use it to resolve references and imports.
         """
         # Expect that has_dwarf_info was called, so at least .debug_info is
         # present.
@@ -197,7 +247,10 @@ class ELFFile(object):
         section_names = ('.debug_info', '.debug_aranges', '.debug_abbrev',
                          '.debug_str', '.debug_line', '.debug_frame',
                          '.debug_loc', '.debug_ranges', '.debug_pubtypes',
-                         '.debug_pubnames')
+                         '.debug_pubnames', '.debug_addr',
+                         '.debug_str_offsets', '.debug_line_str',
+                         '.debug_loclists', '.debug_rnglists',
+                         '.debug_sup', '.gnu_debugaltlink')
 
         compressed = bool(self.get_section_by_name('.zdebug_info'))
         if compressed:
@@ -209,7 +262,9 @@ class ELFFile(object):
         (debug_info_sec_name, debug_aranges_sec_name, debug_abbrev_sec_name,
          debug_str_sec_name, debug_line_sec_name, debug_frame_sec_name,
          debug_loc_sec_name, debug_ranges_sec_name, debug_pubtypes_name,
-         debug_pubnames_name, eh_frame_sec_name) = section_names
+         debug_pubnames_name, debug_addr_name, debug_str_offsets_name,
+         debug_line_str_name, debug_loclists_sec_name, debug_rnglists_sec_name,
+         debug_sup_name, gnu_debugaltlink_name, eh_frame_sec_name) = section_names
 
         debug_sections = {}
         for secname in section_names:
@@ -224,7 +279,11 @@ class ELFFile(object):
                     dwarf_section = self._decompress_dwarf_section(dwarf_section)
                 debug_sections[secname] = dwarf_section
 
-        return DWARFInfo(
+        # Lookup if we have any of the .gnu_debugaltlink (GNU proprietary
+        # implementation) or .debug_sup sections, referencing a supplementary
+        # DWARF file
+
+        dwarfinfo = DWARFInfo(
                 config=DwarfConfig(
                     little_endian=self.little_endian,
                     default_address_size=self.elfclass // 8,
@@ -238,14 +297,40 @@ class ELFFile(object):
                 debug_loc_sec=debug_sections[debug_loc_sec_name],
                 debug_ranges_sec=debug_sections[debug_ranges_sec_name],
                 debug_line_sec=debug_sections[debug_line_sec_name],
-                debug_pubtypes_sec = debug_sections[debug_pubtypes_name],
-                debug_pubnames_sec = debug_sections[debug_pubnames_name]
+                debug_pubtypes_sec=debug_sections[debug_pubtypes_name],
+                debug_pubnames_sec=debug_sections[debug_pubnames_name],
+                debug_addr_sec=debug_sections[debug_addr_name],
+                debug_str_offsets_sec=debug_sections[debug_str_offsets_name],
+                debug_line_str_sec=debug_sections[debug_line_str_name],
+                debug_loclists_sec=debug_sections[debug_loclists_sec_name],
+                debug_rnglists_sec=debug_sections[debug_rnglists_sec_name],
+                debug_sup_sec=debug_sections[debug_sup_name],
+                gnu_debugaltlink_sec=debug_sections[gnu_debugaltlink_name]
                 )
+        if follow_links:
+            dwarfinfo.supplementary_dwarfinfo = self.get_supplementary_dwarfinfo(dwarfinfo)
+        return dwarfinfo
+
+
+    def get_supplementary_dwarfinfo(self, dwarfinfo):
+        """
+        Read supplementary dwarfinfo, from either the standared .debug_sup
+        section or the GNU proprietary .gnu_debugaltlink.
+        """
+        supfilepath = dwarfinfo.parse_debugsupinfo()
+        if supfilepath is not None and self.stream_loader is not None:
+            stream = self.stream_loader(supfilepath)
+            supelffile = ELFFile(stream)
+            dwarf_info = supelffile.get_dwarf_info()
+            stream.close()
+            return dwarf_info
+        return None
+
 
     def has_ehabi_info(self):
         """ Check whether this file appears to have arm exception handler index table.
         """
-        return any(s['sh_type'] == 'SHT_ARM_EXIDX' for s in self.iter_sections())
+        return any(self.iter_sections(type='SHT_ARM_EXIDX'))
 
     def get_ehabi_infos(self):
         """ Generally, shared library and executable contain 1 .ARM.exidx section.
@@ -256,9 +341,8 @@ class ELFFile(object):
         if self['e_type'] == 'ET_REL':
             # TODO: support relocatable file
             assert False, "Current version of pyelftools doesn't support relocatable file."
-        for section in self.iter_sections():
-            if section['sh_type'] == 'SHT_ARM_EXIDX':
-                _ret.append(EHABIInfo(section, self.little_endian))
+        for section in self.iter_sections(type='SHT_ARM_EXIDX'):
+            _ret.append(EHABIInfo(section, self.little_endian))
         return _ret if len(_ret) > 0 else None
 
     def get_machine_arch(self):
@@ -281,7 +365,7 @@ class ELFFile(object):
             'EM_960'           : 'Intel 80960',
             'EM_PPC'           : 'PowerPC',
             'EM_PPC64'         : '64-bit PowerPC',
-            'EM_S390'          : 'IBM System/390',
+            'EM_S390'          : 'IBM S/390',
             'EM_SPU'           : 'IBM SPU/SPC',
             'EM_V800'          : 'NEC V800',
             'EM_FR20'          : 'Fujitsu FR20',
@@ -446,7 +530,11 @@ class ELFFile(object):
             'EM_FT32'          : 'FTDI Chip FT32 32-bit RISC',
             'EM_MOXIE'         : 'Moxie',
             'EM_AMDGPU'        : 'AMD GPU',
-            'EM_RISCV'         : 'RISC-V'
+            'EM_RISCV'         : 'RISC-V',
+            'EM_BPF'           : 'Linux BPF - in-kernel virtual machine',
+            'EM_CSKY'          : 'C-SKY',
+            'EM_LOONGARCH'     : 'LoongArch',
+            'EM_FRV'           : 'Fujitsu FR-V'
         }
 
         return architectures.get(self['e_machine'], '<unknown>')
@@ -523,15 +611,23 @@ class ELFFile(object):
     def _get_section_header(self, n):
         """ Find the header of section #n, parse it and return the struct
         """
+
+        stream_pos = self._section_offset(n)
+        if stream_pos > self.stream_len:
+            return None
+
         return struct_parse(
             self.structs.Elf_Shdr,
             self.stream,
-            stream_pos=self._section_offset(n))
+            stream_pos=stream_pos)
 
     def _get_section_name(self, section_header):
         """ Given a section header, find this section's name in the file's
             string table
         """
+        if self._section_header_stringtable is None:
+            raise ELFParseError("String Table not found")
+
         name_offset = section_header['sh_name']
         return self._section_header_stringtable.get_string(name_offset)
 
@@ -567,12 +663,21 @@ class ELFFile(object):
             return StabSection(section_header, name, self)
         elif sectype == 'SHT_ARM_ATTRIBUTES':
             return ARMAttributesSection(section_header, name, self)
+        elif sectype == 'SHT_RISCV_ATTRIBUTES':
+            return RISCVAttributesSection(section_header, name, self)
         elif sectype == 'SHT_HASH':
             return self._make_elf_hash_section(section_header, name)
         elif sectype == 'SHT_GNU_HASH':
             return self._make_gnu_hash_section(section_header, name)
+        elif sectype == 'SHT_RELR':
+            return RelrRelocationSection(section_header, name, self)
         else:
             return Section(section_header, name, self)
+
+    def _make_section_name_map(self):
+        self._section_name_map = {}
+        for i, sec in enumerate(self.iter_sections()):
+            self._section_name_map[sec.name] = i
 
     def _make_symbol_table_section(self, section_header, name):
         """ Create a SymbolTableSection
@@ -659,8 +764,13 @@ class ELFFile(object):
             table.
         """
         stringtable_section_num = self.get_shstrndx()
+
+        stringtable_section_header = self._get_section_header(stringtable_section_num)
+        if stringtable_section_header is None:
+            return None
+
         return StringTableSection(
-                header=self._get_section_header(stringtable_section_num),
+                header=stringtable_section_header,
                 name='',
                 elffile=self)
 
@@ -674,22 +784,28 @@ class ELFFile(object):
         """ Read the contents of a DWARF section from the stream and return a
             DebugSectionDescriptor. Apply relocations if asked to.
         """
+        phantom_bytes = self.has_phantom_bytes()
         # The section data is read into a new stream, for processing
         section_stream = BytesIO()
-        section_stream.write(section.data())
+        section_data = section.data()
+        section_stream.write(section_data[::2] if phantom_bytes else section_data)
 
         if relocate_dwarf_sections:
             reloc_handler = RelocationHandler(self)
             reloc_section = reloc_handler.find_relocations_for_section(section)
             if reloc_section is not None:
-                reloc_handler.apply_section_relocations(
-                        section_stream, reloc_section)
+                if phantom_bytes:
+                    # No guidance how should the relocation work - before or after the odd byte skip
+                    raise ELFParseError("This binary has relocations in the DWARF sections, currently not supported.")
+                else:
+                    reloc_handler.apply_section_relocations(
+                            section_stream, reloc_section)
 
         return DebugSectionDescriptor(
                 stream=section_stream,
                 name=section.name,
                 global_offset=section['sh_offset'],
-                size=section.data_size,
+                size=section.data_size//2 if phantom_bytes else section.data_size,
                 address=section['sh_addr'])
 
     @staticmethod
@@ -726,3 +842,23 @@ class ELFFile(object):
                 )
 
         return section._replace(stream=uncompressed_stream, size=size)
+
+    def close(self):
+        self.stream.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.close()
+
+    def has_phantom_bytes(self):
+        """The XC16 compiler for the PIC microcontrollers emits DWARF where all odd bytes in all DWARF sections
+           are to be discarded ("phantom").
+
+            We don't know where does the phantom byte discarding fit into the usual chain of section content transforms.
+            There are no XC16/PIC binaries in the corpus with relocations against DWARF, and the DWARF section compression
+            seems to be unsupported by XC16.
+        """
+        # Vendor flag EF_PIC30_NO_PHANTOM_BYTE=0x80000000: clear means phantom bytes are present
+        return self['e_machine'] == 'EM_DSPIC30F' and (self['e_flags'] & 0x80000000) == 0

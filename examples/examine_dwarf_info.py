@@ -7,6 +7,7 @@
 # This code is in the public domain
 #-------------------------------------------------------------------------------
 from __future__ import print_function
+from pathlib import Path
 import sys
 
 # If pyelftools is not installed, the example can also run from the root or
@@ -43,7 +44,7 @@ def process_file(filename):
             print('    Top DIE with tag=%s' % top_DIE.tag)
 
             # We're interested in the filename...
-            print('    name=%s' % top_DIE.get_full_path())
+            print('    name=%s' % Path(top_DIE.get_full_path()).as_posix())
 
 if __name__ == '__main__':
     if sys.argv[1] == '--test':

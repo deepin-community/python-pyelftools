@@ -33,6 +33,9 @@ testlog.addHandler(logging.StreamHandler(sys.stdout))
 # same minor release and keeping track is a headache.
 if platform.system() == "Darwin": # MacOS
     READELF_PATH = 'greadelf'
+elif platform.system() == "Windows":
+    # Point the environment variable READELF at Cygwin's readelf.exe, or some other Windows build
+    READELF_PATH = os.environ.get('READELF', "readelf.exe")
 else:
     READELF_PATH = 'test/external_tools/readelf'
     if not os.path.exists(READELF_PATH):
@@ -63,7 +66,8 @@ def run_test_on_file(filename, verbose=False, opt=None):
             '--debug-dump=info', '--debug-dump=decodedline',
             '--debug-dump=frames', '--debug-dump=frames-interp',
             '--debug-dump=aranges', '--debug-dump=pubtypes',
-            '--debug-dump=pubnames', '--debug-dump=loc'
+            '--debug-dump=pubnames', '--debug-dump=loc',
+            '--debug-dump=Ranges'
             ]
     else:
         options = [opt]
@@ -79,6 +83,15 @@ def run_test_on_file(filename, verbose=False, opt=None):
                 testlog.warning("....will fail because corresponding part of readelf.py is not implemented yet")
                 testlog.info('.......................SKIPPED')
             continue
+
+        # sevaa says: there is another shorted out test; in dwarf_lineprogramv5.elf, the two bytes at 0x2072 were
+        # patched from 0x07 0x10 to 00 00.
+        # Those represented the second instruction in the first FDE in .eh_frame. This changed the instruction
+        # from "DW_CFA_undefined 16" to two NOPs.
+        # GNU readelf 2.38 had a bug here, had to work around:
+        # https://sourceware.org/bugzilla/show_bug.cgi?id=29250
+        # It's been fixed in the binutils' master since, but the latest master will break a lot.
+        # Same patch in  dwarf_test_versions_mix.elf at 0x2061: 07 10 -> 00 00
 
         # stdouts will be a 2-element list: output of readelf and output
         # of scripts/readelf.py
@@ -103,10 +116,11 @@ def run_test_on_file(filename, verbose=False, opt=None):
         else:
             success = False
             testlog.info('.......................FAIL')
+            testlog.info('....for file %s' % filename)
             testlog.info('....for option "%s"' % option)
             testlog.info('....Output #1 is readelf, Output #2 is pyelftools')
             testlog.info('@@ ' + errmsg)
-            dump_output_to_temp_files(testlog, *stdouts)
+            dump_output_to_temp_files(testlog, filename, option, *stdouts)
     return success
 
 
@@ -130,15 +144,39 @@ def compare_output(s1, s2):
     lines1 = prepare_lines(s1)
     lines2 = prepare_lines(s2)
 
-    flag_after_symtable = False
+    flag_in_debug_line_section = False
 
     if len(lines1) != len(lines2):
         return False, 'Number of lines different: %s vs %s' % (
                 len(lines1), len(lines2))
 
+    # Position of the View column in the output file, if parsing readelf..decodedline
+    # output, and the GNU readelf output contains the View column. Otherwise stays -1.
+    view_col_position = -1
     for i in range(len(lines1)):
-        if 'symbol table' in lines1[i]:
-            flag_after_symtable = True
+        if lines1[i].endswith('debug_line section:'):
+            # .debug_line or .zdebug_line
+            flag_in_debug_line_section = True
+
+        # readelf spelling error for GNU property notes
+        lines1[i] = lines1[i].replace('procesor-specific type', 'processor-specific type')
+
+        # The view column position may change from CU to CU:
+        if view_col_position >= 0 and lines1[i].startswith('cu:'):
+            view_col_position = -1
+
+        # Check if readelf..decodedline output line contains the view column
+        if flag_in_debug_line_section and lines1[i].startswith('file name') and view_col_position < 0:
+            view_col_position = lines1[i].find("view")
+            stmt_col_position = lines1[i].find("stmt")
+
+        # Excise the View column from the table, if any.
+        # View_col_position is only set to a nonzero number if one of the previous
+        # lines was a table header line with a "view" in it.
+        # We assume careful formatting on GNU readelf's part - View column values
+        # are not out of line with the View header.
+        if view_col_position >= 0 and not lines1[i].endswith(':'):
+            lines1[i] = lines1[i][:view_col_position] + lines1[i][stmt_col_position:]
 
         # Compare ignoring whitespace
         lines1_parts = lines1[i].split()
@@ -159,12 +197,23 @@ def compare_output(s1, s2):
             sm = SequenceMatcher()
             sm.set_seqs(lines1[i], lines2[i])
             changes = sm.get_opcodes()
-            if flag_after_symtable:
-                # Detect readelf's adding @ with lib and version after
-                # symbol name.
-                if (    len(changes) == 2 and changes[1][0] == 'delete' and
-                        lines1[i][changes[1][1]] == '@'):
-                    ok = True
+            if '[...]' in lines1[i]:
+                # Special case truncations with ellipsis like these:
+                #     .note.gnu.bu[...]        redelf
+                #     .note.gnu.build-i        pyelftools
+                # Or more complex for symbols with versions, like these:
+                #     _unw[...]@gcc_3.0        readelf
+                #     _unwind_resume@gcc_3.0   pyelftools
+                for p1, p2 in zip(lines1_parts, lines2_parts):
+                    dots_start = p1.find('[...]')
+                    if dots_start != -1:
+                        break
+                ok = p1.endswith('[...]') and p1[:dots_start] == p2[:dots_start]
+                if not ok:
+                    dots_end = dots_start + 5
+                    if len(p1) > dots_end and p1[dots_end] == '@':
+                        ok = (    p1[:dots_start] == p2[:dots_start]
+                              and p1[p1.rfind('@'):] == p2[p2.rfind('@'):])
             elif 'at_const_value' in lines1[i]:
                 # On 32-bit machines, readelf doesn't correctly represent
                 # some boundary LEB128 numbers
@@ -175,11 +224,11 @@ def compare_output(s1, s2):
             elif 'os/abi' in lines1[i]:
                 if 'unix - gnu' in lines1[i] and 'unix - linux' in lines2[i]:
                     ok = True
-            elif (  'unknown at value' in lines1[i] and
-                    'dw_at_apple' in lines2[i]):
-                ok = True
+            elif len(lines1_parts) == 3 and lines1_parts[2] == 'nt_gnu_property_type_0':
+                # readelf does not seem to print a readable description for this
+                ok = lines1_parts == lines2_parts[:3]
             else:
-                for s in ('t (tls)', 'l (large)'):
+                for s in ('t (tls)', 'l (large)', 'd (mbind)'):
                     if s in lines1[i] or s in lines2[i]:
                         ok = True
                         break

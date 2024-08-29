@@ -131,6 +131,8 @@ DW_ID_case_insensitive = 3
 DW_CC_normal = 0x1
 DW_CC_program = 0x2
 DW_CC_nocall = 0x3
+DW_CC_pass_by_reference = 0x4
+DW_CC_pass_by_valuee = 0x5
 
 
 # Ordering
@@ -160,6 +162,15 @@ DW_LNE_set_discriminator = 0x04
 DW_LNE_lo_user = 0x80
 DW_LNE_hi_user = 0xff
 
+# Line program header content types
+#
+DW_LNCT_path = 0x01
+DW_LNCT_directory_index = 0x02
+DW_LNCT_timestamp = 0x03
+DW_LNCT_size = 0x04
+DW_LNCT_MD5 = 0x05
+DW_LNCT_lo_user = 0x2000
+DW_LNCT_hi_user = 0x3fff
 
 # Call frame instructions
 #
@@ -197,4 +208,21 @@ DW_CFA_def_cfa_offset_sf = 0x13
 DW_CFA_val_offset = 0x14
 DW_CFA_val_offset_sf = 0x15
 DW_CFA_val_expression = 0x16
+DW_CFA_GNU_window_save = 0x2d # Used on SPARC, not in the corpus
+DW_CFA_AARCH64_negate_ra_state = 0x2d
 DW_CFA_GNU_args_size = 0x2e
+
+
+# Compilation unit types
+#
+# DWARFv5 introduces the "unit_type" field to each CU header, allowing
+# individual CUs to indicate whether they're complete, partial, and so forth.
+# See DWARFv5 3.1 ("Unit Entries") and 7.5.1 ("Unit Headers").
+DW_UT_compile = 0x01
+DW_UT_type = 0x02
+DW_UT_partial = 0x03
+DW_UT_skeleton = 0x04
+DW_UT_split_compile = 0x05
+DW_UT_split_type = 0x06
+DW_UT_lo_user = 0x80
+DW_UT_hi_user = 0xff
